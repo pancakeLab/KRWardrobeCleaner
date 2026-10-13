@@ -21,7 +21,9 @@ public sealed record PhysicalGearEntry(
     bool IsCrafterGatherer,
     bool IsDyed,
     bool IsGlamoured,
-    bool HasMateria);
+    bool HasMateria,
+    int ConditionPercent,
+    int MateriaCount);
 
 public sealed record DresserArmoireEntry(
     int DresserSlot,
@@ -99,15 +101,7 @@ public sealed unsafe class InventoryScanner
                 if (requireGlamourable && !excel.IsGlamourable(itemId))
                     continue;
 
-                result.Add(new(
-                    new(type, slotIndex),
-                    itemId,
-                    excel.NameOf(itemId),
-                    excel.RequiredLevelOf(itemId),
-                    excel.IsCrafterGathererOnly(itemId),
-                    item->Stains[0] != 0 || item->Stains[1] != 0,
-                    item->GlamourId != 0,
-                    HasMateria(item)));
+                result.Add(Describe(type, slotIndex, item, itemId));
             }
         }
 
@@ -200,6 +194,99 @@ public sealed unsafe class InventoryScanner
     {
         var inventory = InventoryManager.Instance();
         return inventory == null ? 0 : checked((int)inventory->GetEmptySlotsInBag());
+    }
+
+    /// Equipment in a single container (e.g. one armoury category). Same shape as Scan().
+    public List<PhysicalGearEntry> ScanContainer(InventoryType type)
+    {
+        var result = new List<PhysicalGearEntry>();
+        var inventory = InventoryManager.Instance();
+        if (inventory == null)
+            return result;
+
+        var container = inventory->GetInventoryContainer(type);
+        if (container == null || !container->IsLoaded)
+            return result;
+
+        for (var slotIndex = 0; slotIndex < container->Size; slotIndex++)
+        {
+            var item = container->GetInventorySlot(slotIndex);
+            if (item == null || item->ItemId == 0)
+                continue;
+
+            var itemId = item->GetBaseItemId();
+            if (itemId == 0 || !excel.IsEquipment(itemId))
+                continue;
+
+            result.Add(Describe(type, slotIndex, item, itemId));
+        }
+
+        return result
+            .OrderBy(x => x.Name, StringComparer.CurrentCulture)
+            .ThenBy(x => x.Key.Slot)
+            .ToList();
+    }
+
+    public int CountFreeSlotsIn(InventoryType type)
+    {
+        var inventory = InventoryManager.Instance();
+        if (inventory == null) return 0;
+        var container = inventory->GetInventoryContainer(type);
+        if (container == null || !container->IsLoaded) return 0;
+
+        var free = 0;
+        for (var i = 0; i < container->Size; i++)
+        {
+            var item = container->GetInventorySlot(i);
+            if (item == null || item->ItemId == 0) free++;
+        }
+        return free;
+    }
+
+    public bool TryFindFirstEmptySlotIn(InventoryType type, out ItemLocationKey key)
+    {
+        var inventory = InventoryManager.Instance();
+        if (inventory != null)
+        {
+            var container = inventory->GetInventoryContainer(type);
+            if (container != null && container->IsLoaded)
+            {
+                for (var i = 0; i < container->Size; i++)
+                {
+                    var item = container->GetInventorySlot(i);
+                    if (item == null || item->ItemId == 0)
+                    {
+                        key = new(type, i);
+                        return true;
+                    }
+                }
+            }
+        }
+
+        key = default;
+        return false;
+    }
+
+    private PhysicalGearEntry Describe(InventoryType type, int slotIndex, InventoryItem* item, uint itemId)
+        => new(
+            new(type, slotIndex),
+            itemId,
+            excel.NameOf(itemId),
+            excel.RequiredLevelOf(itemId),
+            excel.IsCrafterGathererOnly(itemId),
+            item->Stains[0] != 0 || item->Stains[1] != 0,
+            item->GlamourId != 0,
+            HasMateria(item),
+            item->Condition * 100 / 30000,   // 30000 = 100% durability
+            MateriaCount(item));
+
+    private static int MateriaCount(InventoryItem* item)
+    {
+        var n = 0;
+        for (var i = 0; i < item->Materia.Length; i++)
+            if (item->Materia[i] != 0)
+                n++;
+        return n;
     }
 
     private static bool HasMateria(InventoryItem* item)
@@ -418,555 +505,6 @@ public sealed unsafe class Stage1DresserToInventory
     }
 
     private static uint Normalize(uint id) => id >= 1_000_000 ? id % 1_000_000 : id;
-}
-
-public sealed unsafe class OutfitCatalog
-{
-    public sealed record SetInfo(uint RowId, string Name, IReadOnlyList<uint> ItemIds);
-
-    private readonly ExcelIndex excel;
-    private readonly Dictionary<uint, SetInfo> sets = [];
-    private readonly Dictionary<uint, List<SetInfo>> byPiece = [];
-
-    public OutfitCatalog(IDataManager data, ExcelIndex excel)
-    {
-        this.excel = excel;
-        var sheet = data.GetExcelSheet<RawRow>(name: "MirageStoreSetItem");
-        if (sheet == null) return;
-
-        foreach (var row in sheet)
-        {
-            if (row.RowId == 0) continue;
-            var ids = new List<uint>();
-            for (var i = 0; i < 9; i++)
-            {
-                uint id;
-                try { id = Convert.ToUInt32(row.ReadColumn(2 + i)); }
-                catch { id = 0; }
-                ids.Add(id);
-            }
-
-            if (ids.Count(x => x != 0) == 0) continue;
-            var set = new SetInfo(row.RowId, excel.NameOf(row.RowId), ids);
-            sets[row.RowId] = set;
-            foreach (var id in ids.Where(x => x != 0))
-            {
-                if (!byPiece.TryGetValue(id, out var list))
-                    byPiece[id] = list = [];
-                list.Add(set);
-            }
-        }
-    }
-
-    public IEnumerable<SetInfo> SetsFor(uint itemId)
-        => byPiece.TryGetValue(itemId, out var list) ? list : [];
-
-    public IEnumerable<SetInfo> All => sets.Values;
-}
-
-public sealed unsafe class Stage2InventoryToDresser
-{
-    private readonly ExcelIndex excel;
-    private readonly InventoryScanner scanner;
-    private readonly OutfitCatalog outfits;
-    private readonly IGameGui gameGui;
-    private readonly Configuration config;
-    private readonly System.Action saveConfig;
-
-    private readonly List<PhysicalGearEntry> entries = [];
-    private readonly HashSet<ItemLocationKey> selected = [];
-    private readonly Queue<SetBatch> setQueue = new();
-    private readonly Queue<PhysicalGearEntry> singleQueue = new();
-
-    private PhysicalGearEntry? pendingSingle;
-    private long pendingSingleAt;
-    private long nextSetActionAt;
-    private SingleStoreState singleState;
-
-    public IReadOnlyList<PhysicalGearEntry> Entries => entries;
-    public IReadOnlySet<ItemLocationKey> Selected => selected;
-    public bool IsRunning { get; private set; }
-    public int Stored { get; private set; }
-    public int Skipped { get; private set; }
-    public int Failed { get; private set; }
-    public string Status { get; private set; } = "환상의 옷장을 연 뒤 후보를 검색해 주세요.";
-    public string? LastItemStatus { get; private set; }
-
-    public Stage2InventoryToDresser(ExcelIndex excel, InventoryScanner scanner, OutfitCatalog outfits, IGameGui gameGui, Configuration config, System.Action saveConfig)
-    {
-        this.excel = excel;
-        this.scanner = scanner;
-        this.outfits = outfits;
-        this.gameGui = gameGui;
-        this.config = config;
-        this.saveConfig = saveConfig;
-    }
-
-    public void UpdateIncludeDyed(bool value)
-    {
-        config.Stage2IncludeDyed = value;
-        saveConfig();
-    }
-
-    public int Scan()
-    {
-        if (IsRunning) return entries.Count;
-        entries.Clear();
-        selected.Clear();
-
-        var manager = MirageManager.Instance();
-        if (manager == null || !manager->PrismBoxLoaded)
-        {
-            Status = "환상의 옷장을 연 상태에서 검색해 주세요.";
-            return 0;
-        }
-
-        var storedPieces = BuildStoredPieceSet(manager);
-        foreach (var entry in scanner.Scan(includeBags: true, includeArmory: true, requireGlamourable: true))
-        {
-            if (storedPieces.Contains(entry.ItemId))
-                continue;
-            entries.Add(entry);
-        }
-
-        Status = $"검색 완료: 환상의 옷장에 넣을 수 있는 장비 {entries.Count}개.";
-        return entries.Count;
-    }
-
-    public void SetSelected(ItemLocationKey key, bool value)
-    {
-        if (value) selected.Add(key);
-        else selected.Remove(key);
-    }
-
-    public void SelectAll(bool value)
-    {
-        selected.Clear();
-        if (!value) return;
-        foreach (var entry in entries)
-            selected.Add(entry.Key);
-    }
-
-    public void SelectExistingSetCandidates()
-    {
-        selected.Clear();
-        var manager = MirageManager.Instance();
-        if (manager == null || !manager->PrismBoxLoaded)
-        {
-            Status = "환상의 옷장 데이터를 읽을 수 없습니다.";
-            return;
-        }
-
-        var existing = GetExistingSets(manager);
-        foreach (var entry in entries)
-        {
-            if (entry.IsDyed && !config.Stage2IncludeDyed)
-                continue;
-
-            foreach (var set in outfits.SetsFor(entry.ItemId))
-            {
-                if (!existing.TryGetValue(set.RowId, out var boxIndex))
-                    continue;
-
-                var canFill = false;
-                for (var slot = 0; slot < set.ItemIds.Count && slot < 9; slot++)
-                {
-                    if (set.ItemIds[slot] == entry.ItemId && !manager->IsSetSlotUnlocked(boxIndex, slot))
-                    {
-                        canFill = true;
-                        break;
-                    }
-                }
-
-                if (canFill)
-                {
-                    selected.Add(entry.Key);
-                    break;
-                }
-            }
-        }
-
-        Status = $"기존 세트에 추가 가능한 항목 {selected.Count}개를 체크했습니다.";
-    }
-
-    public bool StartExistingSetsOnly() => Start(storeRemainingSingles: false, existingOnly: true);
-    public bool StartSetsThenSingles() => Start(storeRemainingSingles: true, existingOnly: false);
-
-    private bool Start(bool storeRemainingSingles, bool existingOnly)
-    {
-        if (IsRunning) return false;
-        if (!IsDresserReady())
-        {
-            Status = "환상의 옷장과 '아이템 맡기기' 목록을 연 상태에서 실행해 주세요.";
-            return false;
-        }
-
-        var chosen = entries
-            .Where(x => selected.Contains(x.Key))
-            .Where(x => config.Stage2IncludeDyed || !x.IsDyed)
-            .ToList();
-
-        if (chosen.Count == 0)
-        {
-            Status = "현재 옵션 조건에서 처리할 체크 항목이 없습니다.";
-            return false;
-        }
-
-        setQueue.Clear();
-        singleQueue.Clear();
-        pendingSingle = null;
-        nextSetActionAt = 0;
-        singleState = SingleStoreState.None;
-
-        var manager = MirageManager.Instance()!;
-        var existing = GetExistingSets(manager);
-        var consumed = new HashSet<ItemLocationKey>();
-
-        foreach (var set in outfits.All.OrderBy(x => x.Name, StringComparer.CurrentCulture))
-        {
-            var batch = new List<SetPiece>();
-            var localUsed = new HashSet<ItemLocationKey>();
-
-            for (var slotIndex = 0; slotIndex < set.ItemIds.Count && slotIndex < 9; slotIndex++)
-            {
-                var requiredId = set.ItemIds[slotIndex];
-                if (requiredId == 0)
-                    continue;
-
-                if (existing.TryGetValue(set.RowId, out var existingIndexForSlot) &&
-                    manager->IsSetSlotUnlocked(existingIndexForSlot, slotIndex))
-                    continue;
-
-                var piece = chosen.FirstOrDefault(x =>
-                    x.ItemId == requiredId &&
-                    !consumed.Contains(x.Key) &&
-                    !localUsed.Contains(x.Key));
-
-                if (piece is null)
-                    continue;
-
-                batch.Add(new(piece, slotIndex));
-                localUsed.Add(piece.Key);
-            }
-
-            if (batch.Count == 0)
-                continue;
-
-            if (existing.TryGetValue(set.RowId, out var existingIndex))
-            {
-                setQueue.Enqueue(new(set, batch, existingIndex));
-                foreach (var piece in batch)
-                    consumed.Add(piece.Entry.Key);
-            }
-            else if (!existingOnly && batch.Count >= 2)
-            {
-                setQueue.Enqueue(new(set, batch, null));
-                foreach (var piece in batch)
-                    consumed.Add(piece.Entry.Key);
-            }
-        }
-
-        if (storeRemainingSingles)
-        {
-            foreach (var entry in chosen.Where(x => !consumed.Contains(x.Key)))
-                singleQueue.Enqueue(entry);
-        }
-
-        if (setQueue.Count == 0 && singleQueue.Count == 0)
-        {
-            Status = existingOnly
-                ? "체크 항목 중 기존 세트에 추가할 수 있는 아이템이 없습니다."
-                : "저장할 수 있는 체크 항목이 없습니다.";
-            return false;
-        }
-
-        Stored = Skipped = Failed = 0;
-        LastItemStatus = null;
-        IsRunning = true;
-        Status = $"저장 시작: 세트 작업 {setQueue.Count}개 · 단벌 {singleQueue.Count}개.";
-        return true;
-    }
-
-    public void Stop(string reason = "2단계 작업을 중지했습니다.")
-    {
-        IsRunning = false;
-        pendingSingle = null;
-        singleState = SingleStoreState.None;
-        Status = reason;
-    }
-
-    public void Tick()
-    {
-        if (!IsRunning) return;
-        if (!IsDresserReady())
-        {
-            Stop("환상의 옷장 또는 아이템 맡기기 목록이 닫혀 작업을 중지했습니다.");
-            return;
-        }
-
-        if (pendingSingle is not null)
-        {
-            TickSingle();
-            return;
-        }
-
-        if (Environment.TickCount64 < nextSetActionAt)
-            return;
-
-        if (setQueue.TryDequeue(out var batch))
-        {
-            StoreSetBatch(batch);
-            return;
-        }
-
-        if (singleQueue.TryDequeue(out var single))
-        {
-            pendingSingle = single;
-            pendingSingleAt = Environment.TickCount64;
-            singleState = SingleStoreState.Select;
-            TickSingle();
-            return;
-        }
-
-        IsRunning = false;
-        var completed = $"완료: 저장 {Stored} · 제외 {Skipped} · 실패 {Failed}";
-        Scan();
-        Status = completed;
-    }
-
-    private void StoreSetBatch(SetBatch batch)
-    {
-        var manager = MirageManager.Instance();
-        var inventory = InventoryManager.Instance();
-        if (manager == null || inventory == null)
-        {
-            Stop("환상의 옷장 또는 인벤토리 데이터를 읽을 수 없습니다.");
-            return;
-        }
-
-        Span<InventoryType> containers = stackalloc InventoryType[9];
-        Span<ushort> slots = stackalloc ushort[9];
-        containers.Fill(InventoryType.Invalid);
-        slots.Clear();
-
-        var filled = 0;
-        foreach (var setPiece in batch.Pieces)
-        {
-            var piece = setPiece.Entry;
-            var slot = setPiece.SetSlot;
-
-            if (!scanner.TryResolve(piece.Key, piece.ItemId, out _))
-                continue;
-            if (slot < 0 || slot >= 9)
-                continue;
-            if (batch.ExistingIndex is uint idx && manager->IsSetSlotUnlocked(idx, slot))
-                continue;
-
-            containers[filled] = piece.Key.Container;
-            slots[filled] = (ushort)piece.Key.Slot;
-            filled++;
-        }
-
-        var minimum = batch.ExistingIndex.HasValue ? 1 : 2;
-        if (filled < minimum)
-        {
-            Skipped++;
-            LastItemStatus = $"{batch.Set.Name}: 저장 가능한 체크 항목이 부족해 건너뜁니다.";
-            return;
-        }
-
-        bool sent;
-        fixed (InventoryType* cp = containers)
-        fixed (ushort* sp = slots)
-        {
-            sent = batch.ExistingIndex is uint idx
-                ? manager->StoreExistingOutfit(idx, cp, sp)
-                : manager->StoreNewOutfit(batch.Set.RowId, cp, sp);
-        }
-
-        if (sent)
-        {
-            Stored += filled;
-            LastItemStatus = $"{batch.Set.Name}: {filled}개 세트 저장 요청 완료.";
-        }
-        else
-        {
-            Failed += filled;
-            LastItemStatus = $"{batch.Set.Name}: 세트 저장 요청이 거절되었습니다.";
-        }
-
-        nextSetActionAt = Environment.TickCount64 + 700;
-    }
-
-    private void TickSingle()
-    {
-        var entry = pendingSingle!;
-        var now = Environment.TickCount64;
-
-        if (!scanner.TryResolve(entry.Key, entry.ItemId, out _))
-        {
-            Stored++;
-            LastItemStatus = $"{entry.Name}: 인벤토리에서 사라져 저장 완료로 확인했습니다.";
-            pendingSingle = null;
-            singleState = SingleStoreState.None;
-            return;
-        }
-
-        if (now - pendingSingleAt > 12000)
-        {
-            Failed++;
-            LastItemStatus = $"{entry.Name}: 단벌 저장 완료를 확인하지 못해 건너뜁니다.";
-            pendingSingle = null;
-            singleState = SingleStoreState.None;
-            return;
-        }
-
-        switch (singleState)
-        {
-            case SingleStoreState.Select:
-            {
-                var agent = AgentMiragePrismPrismBox.Instance();
-                var data = agent == null ? null : agent->Data;
-                if (data == null)
-                {
-                    Stop("환상의 옷장 맡기기 데이터를 읽을 수 없습니다.");
-                    return;
-                }
-
-                var row = -1;
-                for (var i = 0; i < data->CrystallizeItemCount; i++)
-                {
-                    var candidate = data->CrystallizeItems[i];
-                    if (candidate.Inventory == entry.Key.Container &&
-                        candidate.Slot == entry.Key.Slot &&
-                        Normalize(candidate.ItemId) == entry.ItemId)
-                    {
-                        row = i;
-                        break;
-                    }
-                }
-
-                if (row < 0)
-                {
-                    Skipped++;
-                    LastItemStatus = $"{entry.Name}: 게임의 맡기기 목록에서 찾지 못해 건너뜁니다.";
-                    pendingSingle = null;
-                    singleState = SingleStoreState.None;
-                    return;
-                }
-
-                if (!FireCallback("MiragePrismPrismBoxCrystallize", 0, row))
-                    return;
-
-                singleState = SingleStoreState.Confirm;
-                return;
-            }
-
-            case SingleStoreState.Confirm:
-                if (TryConfirmYesNoForItem(entry.Name))
-                    singleState = SingleStoreState.Wait;
-                return;
-
-            case SingleStoreState.Wait:
-                return;
-        }
-    }
-
-    private HashSet<uint> BuildStoredPieceSet(MirageManager* manager)
-    {
-        var result = new HashSet<uint>();
-        var setById = outfits.All.ToDictionary(x => x.RowId);
-        for (var i = 0; i < manager->PrismBoxItemIds.Length; i++)
-        {
-            var id = Normalize(manager->PrismBoxItemIds[i]);
-            if (id == 0) continue;
-
-            if (!setById.TryGetValue(id, out var set))
-            {
-                result.Add(id);
-                continue;
-            }
-
-            for (var slot = 0; slot < set.ItemIds.Count; slot++)
-                if (set.ItemIds[slot] != 0 && manager->IsSetSlotUnlocked((uint)i, slot))
-                    result.Add(set.ItemIds[slot]);
-        }
-        return result;
-    }
-
-    private Dictionary<uint, uint> GetExistingSets(MirageManager* manager)
-    {
-        var result = new Dictionary<uint, uint>();
-        var setIds = outfits.All.Select(x => x.RowId).ToHashSet();
-        for (var i = 0; i < manager->PrismBoxItemIds.Length; i++)
-        {
-            var id = Normalize(manager->PrismBoxItemIds[i]);
-            if (id != 0 && setIds.Contains(id))
-                result[id] = (uint)i;
-        }
-        return result;
-    }
-
-    private bool IsDresserReady()
-    {
-        var manager = MirageManager.Instance();
-        return manager != null &&
-               manager->PrismBoxLoaded &&
-               IsAddonReady("MiragePrismPrismBox") &&
-               IsAddonReady("MiragePrismPrismBoxCrystallize");
-    }
-
-    private bool IsAddonReady(string name)
-    {
-        var addon = (AtkUnitBase*)gameGui.GetAddonByName(name).Address;
-        return addon != null && addon->IsVisible && addon->IsReady;
-    }
-
-    private bool FireCallback(string addonName, params int[] values)
-    {
-        var addon = (AtkUnitBase*)gameGui.GetAddonByName(addonName).Address;
-        if (addon == null || !addon->IsVisible || !addon->IsReady)
-            return false;
-
-        var atk = stackalloc AtkValue[values.Length];
-        for (var i = 0; i < values.Length; i++)
-            atk[i].SetInt(values[i]);
-        addon->FireCallback((uint)values.Length, atk);
-        return true;
-    }
-
-    private bool TryConfirmYesNoForItem(string expectedItemName)
-    {
-        for (var i = 1; i <= 4; i++)
-        {
-            var yesno = (AddonSelectYesno*)gameGui.GetAddonByName("SelectYesno", i).Address;
-            if (yesno == null || !yesno->AtkUnitBase.IsVisible || !yesno->AtkUnitBase.IsReady)
-                continue;
-
-            var prompt = yesno->PromptText == null ? string.Empty : yesno->PromptText->NodeText.ToString();
-            if (string.IsNullOrWhiteSpace(prompt) ||
-                !prompt.Contains(expectedItemName, StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            yesno->AtkUnitBase.FireCallbackInt(0);
-            return true;
-        }
-
-        return false;
-    }
-
-    private static int IndexOf(IReadOnlyList<uint> list, uint value)
-    {
-        for (var i = 0; i < list.Count; i++)
-            if (list[i] == value) return i;
-        return -1;
-    }
-
-    private static uint Normalize(uint id) => id >= 1_000_000 ? id % 1_000_000 : id;
-
-    private sealed record SetPiece(PhysicalGearEntry Entry, int SetSlot);
-    private sealed record SetBatch(OutfitCatalog.SetInfo Set, IReadOnlyList<SetPiece> Pieces, uint? ExistingIndex);
-    private enum SingleStoreState { None, Select, Confirm, Wait }
 }
 
 public sealed unsafe class Stage3ArmoryToInventory
