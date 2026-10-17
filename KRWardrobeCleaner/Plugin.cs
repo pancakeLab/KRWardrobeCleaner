@@ -10,7 +10,7 @@ namespace KRWardrobeCleaner;
 
 public sealed class Plugin : IDalamudPlugin
 {
-    private const string VersionLabel = "v0.11.2";
+    private const string VersionLabel = "v0.11.3";
     private static readonly string[] CommandNames = ["/kwc", "/가방"];
 
     private static readonly Vector4 ColorOk = new(0.60f, 0.90f, 0.60f, 1f);
@@ -37,6 +37,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IGameGui GameGui { get; private set; } = null!;
     [PluginService] internal static IPluginLog Log { get; private set; } = null!;
     [PluginService] internal static IObjectTable Objects { get; private set; } = null!;
+    [PluginService] internal static ICondition Condition { get; private set; } = null!;
 
     private readonly Configuration config;
     private readonly GlamourStateCache glamourCache;
@@ -65,7 +66,7 @@ public sealed class Plugin : IDalamudPlugin
         filter = new GearFilter(excel, config, dresserSnapshot);
         stage1 = new Stage1DresserToInventory(excel, glamourCache, GameGui, config, SaveConfig);
         duplicates = new DresserDuplicateCleaner(excel, outfits, GameGui, Log, config, SaveConfig);
-        stage2 = new Stage2InventoryToDresser(excel, scanner, outfits, filter, GameGui, Objects, Log, config, SaveConfig);
+        stage2 = new Stage2InventoryToDresser(excel, scanner, outfits, filter, GameGui, Objects, Condition, Log, config, SaveConfig);
         transfer = new GearTransfer(excel, scanner, filter, Log, config, SaveConfig);
         stage4 = new Stage4Discard(scanner, GameGui, config, SaveConfig);
 
@@ -463,9 +464,9 @@ public sealed class Plugin : IDalamudPlugin
             stage2.StartExistingSetsOnly();
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("옷장에 이미 있는 의상 세트의 빈 조각만 채웁니다.");
         ImGui.SameLine();
-        if (PrimaryButton($"세트화 가능한 것만 넣기 ({stage2.Selected.Count}개)##s2go3") && CanStart(stage2.IsRunning))
+        if (PrimaryButton($"세트화 가능한 것만 넣기 ({stage2.SelectedWithOutfit}개)##s2go3") && CanStart(stage2.IsRunning))
             stage2.StartSetsOnly();
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip("기존 세트 보충 + 조각이 2개 이상 모인 새 세트만 넣고, 단벌은 넣지 않습니다.");
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("의상 세트가 있는 장비만 넣습니다(기존 세트 보충 + 새 세트, 조각 1개부터). 세트가 없는 장비는 그대로 둡니다.");
         ImGui.SameLine();
         if (PrimaryButton($"세트 우선, 나머지는 단벌로 넣기 ({stage2.Selected.Count}개)##s2go2") && CanStart(stage2.IsRunning))
             stage2.StartSetsThenSingles();
@@ -500,7 +501,7 @@ public sealed class Plugin : IDalamudPlugin
             ImGui.TextUnformatted(entry.RequiredLevel.ToString());
             ImGui.TableNextColumn();
             if (reason != null) ImGui.TextColored(ColorWarn, reason);
-            Tags((entry.IsDyed, "염색됨"), (reason == null && entry.MateriaCount > 0, $"마테리아 {entry.MateriaCount}"));
+            Tags((stage2.HasOutfit(entry.ItemId), "세트 가능"), (entry.IsDyed, "염색됨"), (reason == null && entry.MateriaCount > 0, $"마테리아 {entry.MateriaCount}"));
         }
         ImGui.EndTable();
     }

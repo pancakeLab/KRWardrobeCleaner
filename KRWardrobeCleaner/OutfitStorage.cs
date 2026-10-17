@@ -1,4 +1,5 @@
 using System.Numerics;
+using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.ClientState.Objects.Types;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
@@ -113,6 +114,7 @@ public sealed unsafe class Stage2InventoryToDresser
     private readonly OutfitCatalog outfits;
     private readonly IGameGui gameGui;
     private readonly IObjectTable objects;
+    private readonly ICondition condition;
     private readonly IPluginLog log;
     private readonly Configuration config;
     private readonly System.Action saveConfig;
@@ -157,14 +159,17 @@ public sealed unsafe class Stage2InventoryToDresser
     public int Done => Stored + Skipped + Failed;
     public bool IsMatched(ItemLocationKey key) => matched.Contains(key);
     public int MatchedCount => matched.Count;
+    public bool HasOutfit(uint itemId) => outfits.SetsFor(itemId).Any();
+    public int SelectedWithOutfit => entries.Count(e => selected.Contains(e.Key) && HasOutfit(e.ItemId));
     public string Status { get; private set; } = "환상의 옷장을 연 뒤 후보를 검색해 주세요.";
     public string? LastItemStatus { get; private set; }
 
-    public Stage2InventoryToDresser(ExcelIndex excel, InventoryScanner scanner, OutfitCatalog outfits, GearFilter filter, IGameGui gameGui, IObjectTable objects, IPluginLog log, Configuration config, System.Action saveConfig)
+    public Stage2InventoryToDresser(ExcelIndex excel, InventoryScanner scanner, OutfitCatalog outfits, GearFilter filter, IGameGui gameGui, IObjectTable objects, ICondition condition, IPluginLog log, Configuration config, System.Action saveConfig)
     {
         this.excel = excel;
         this.filter = filter;
         this.objects = objects;
+        this.condition = condition;
         this.scanner = scanner;
         this.outfits = outfits;
         this.gameGui = gameGui;
@@ -410,9 +415,11 @@ public sealed unsafe class Stage2InventoryToDresser
                 foreach (var piece in batch)
                     consumed.Add(piece.Entry.Key);
             }
-            else if (!existingOnly && batch.Count >= 2)
+            else if (!existingOnly)
             {
-                setQueue.Enqueue(new(set, batch, null));
+                // A new (partial) outfit can start from a single piece. If the game refuses the set
+                // request, the pieces are retried as singles when that mode is on.
+                setQueue.Enqueue(new(set, batch, null, storeRemainingSingles));
                 foreach (var piece in batch)
                     consumed.Add(piece.Entry.Key);
             }
@@ -454,6 +461,8 @@ public sealed unsafe class Stage2InventoryToDresser
 
     public void Stop(string reason = "2단계 작업을 중지했습니다.")
     {
+        if (IsRunning)
+            log.Information("[KWC] s2 stop: {Reason} (stored {Stored} skipped {Skipped} failed {Failed}, sets {Sets} singles {Singles} left)", reason, Stored, Skipped, Failed, setQueue.Count, singleQueue.Count);
         IsRunning = false;
         prestage = null;
         plannedSets = [];
@@ -548,6 +557,8 @@ public sealed unsafe class Stage2InventoryToDresser
         public bool ReopenRequested;
         public int ReopenAttempts;
         public int Total;
+        public long ClosedAt;
+        public long ReadySince;
     }
 
     public bool IsPrestaging => prestage != null;
@@ -570,8 +581,16 @@ public sealed unsafe class Stage2InventoryToDresser
         setQueue.Clear();
         singleQueue.Clear();
 
-        var state = new PrestageState { PhaseAt = Environment.TickCount64, DresserObjectId = FindDresserObjectId() };
         var free = scanner.CountFreeBagSlots();
+        if (free == 0)
+        {
+            RebuildQueuesAfterPrestage([]);
+            LastItemStatus = $"가방 빈칸이 없어 장비함 조각 {armory.Count}개는 이번에 넣지 않습니다. 가방을 비우거나 3번 탭으로 먼저 옮겨 주세요.";
+            Debug("s2 prestage skipped: no free bag slot, {Count} armoury pieces dropped", armory.Count);
+            return;
+        }
+
+        var state = new PrestageState { PhaseAt = Environment.TickCount64, DresserObjectId = FindDresserObjectId() };
         foreach (var e in armory.Values)
         {
             if (state.ToMove.Count >= free) break;
@@ -613,6 +632,20 @@ public sealed unsafe class Stage2InventoryToDresser
                     return;
                 }
 
+                if (st.ClosedAt == 0)
+                {
+                    st.ClosedAt = now;
+                    return;
+                }
+
+                // The window is gone, but the game may still be finishing the event; moving too early is refused.
+                var occupied = condition[ConditionFlag.OccupiedInEvent] || condition[ConditionFlag.OccupiedInQuestEvent] || condition[ConditionFlag.Occupied];
+                if (occupied && now - st.ClosedAt < 4000)
+                    return;
+                if (now - st.ClosedAt < 800)
+                    return;
+
+                Debug("s2 prestage: event ended {Ms} ms after close (occupied={Occ})", now - st.ClosedAt, occupied);
                 st.Phase = PrestagePhase.Moving;
                 st.PhaseAt = now;
                 Status = $"환상의 옷장을 닫았습니다. 장비함 조각 {st.Total}개를 가방으로 옮기는 중…";
@@ -703,7 +736,15 @@ public sealed unsafe class Stage2InventoryToDresser
                 return;
 
             case PrestagePhase.WaitDresser:
-                if (IsDresserReady())
+                if (!IsDresserReady())
+                    st.ReadySince = 0;
+                else if (st.ReadySince == 0)
+                {
+                    st.ReadySince = now;
+                    return;
+                }
+
+                if (IsDresserReady() && now - st.ReadySince >= 600)
                 {
                     Debug("s2 prestage done: dresser ready again, sets={Sets} singles={Singles}", setQueue.Count, singleQueue.Count);
                     prestage = null;
@@ -742,9 +783,7 @@ public sealed unsafe class Stage2InventoryToDresser
                 pieces.Add(p with { Entry = e });
             }
 
-            var min = b.ExistingIndex.HasValue ? 1 : 2;
-            if (pieces.Count >= min) setQueue.Enqueue(new SetBatch(b.Set, pieces, b.ExistingIndex));
-            else Skipped += pieces.Count;
+            if (pieces.Count >= 1) setQueue.Enqueue(new SetBatch(b.Set, pieces, b.ExistingIndex, b.FallbackToSingles));
         }
 
         foreach (var s in plannedSingles)
@@ -912,7 +951,7 @@ public sealed unsafe class Stage2InventoryToDresser
 
         // Everything that could be staged is in the bags now.
         stagingBatch = null;
-        StoreSetBatch(new SetBatch(batch.Set, stagedPieces, batch.ExistingIndex));
+        StoreSetBatch(new SetBatch(batch.Set, stagedPieces, batch.ExistingIndex, batch.FallbackToSingles));
     }
 
     private void StoreSetBatch(SetBatch batch)
@@ -967,7 +1006,7 @@ public sealed unsafe class Stage2InventoryToDresser
             sent.Add(setPiece);
         }
 
-        var minimum = batch.ExistingIndex.HasValue ? 1 : 2;
+        const int minimum = 1;
         if (sent.Count < minimum)
         {
             Skipped += sent.Count;
@@ -991,8 +1030,15 @@ public sealed unsafe class Stage2InventoryToDresser
 
         if (ok)
         {
-            pendingBatch = new(batch.Set, sent, Environment.TickCount64);
+            pendingBatch = new(batch.Set, sent, Environment.TickCount64, batch.FallbackToSingles);
             LastItemStatus = $"{batch.Set.Name}: {sent.Count}개 세트 저장 요청, 게임 반영을 확인하는 중…";
+        }
+        else if (batch.FallbackToSingles)
+        {
+            foreach (var p in sent) singleQueue.Enqueue(p.Entry);
+            LastItemStatus = $"{batch.Set.Name}: 세트 저장 요청이 거절되어 {sent.Count}개를 단벌로 다시 시도합니다.";
+            Debug("s2 store rejected for '{Set}', {Count} pieces requeued as singles", batch.Set.Name, sent.Count);
+            nextSetActionAt = Environment.TickCount64 + 300;
         }
         else
         {
@@ -1026,8 +1072,18 @@ public sealed unsafe class Stage2InventoryToDresser
 
         var done = pb.Pieces.Count - remaining.Count;
         Stored += done;
-        Failed += remaining.Count;
         var names = string.Join(", ", remaining.Select(p => p.Entry.Name));
+        if (pb.FallbackToSingles)
+        {
+            foreach (var p in remaining) singleQueue.Enqueue(p.Entry);
+            LastItemStatus = $"{pb.Set.Name}: {done}개 저장 확인, {remaining.Count}개는 세트로 받지 않아 단벌로 다시 시도합니다 ({names}).";
+            Debug("s2 set '{Set}' not accepted for {Count} pieces, requeued as singles", pb.Set.Name, remaining.Count);
+            pendingBatch = null;
+            nextSetActionAt = now + 300;
+            return;
+        }
+
+        Failed += remaining.Count;
         LastItemStatus = $"{pb.Set.Name}: {done}개 저장 확인, {remaining.Count}개는 게임이 처리하지 않았습니다 ({names}). 로그를 확인해 주세요.";
         foreach (var p in remaining)
         {
@@ -1340,7 +1396,7 @@ public sealed unsafe class Stage2InventoryToDresser
     private static uint Normalize(uint id) => id >= 1_000_000 ? id % 1_000_000 : id;
 
     private sealed record SetPiece(PhysicalGearEntry Entry, int SetSlot);
-    private sealed record SetBatch(OutfitCatalog.SetInfo Set, IReadOnlyList<SetPiece> Pieces, uint? ExistingIndex);
-    private sealed record PendingBatch(OutfitCatalog.SetInfo Set, IReadOnlyList<SetPiece> Pieces, long SentAt);
+    private sealed record SetBatch(OutfitCatalog.SetInfo Set, IReadOnlyList<SetPiece> Pieces, uint? ExistingIndex, bool FallbackToSingles = false);
+    private sealed record PendingBatch(OutfitCatalog.SetInfo Set, IReadOnlyList<SetPiece> Pieces, long SentAt, bool FallbackToSingles = false);
     private enum SingleStoreState { None, Select, WaitMove, Confirm, Wait }
 }
