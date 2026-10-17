@@ -10,7 +10,7 @@ namespace KRWardrobeCleaner;
 
 public sealed class Plugin : IDalamudPlugin
 {
-    private const string VersionLabel = "v0.11.5";
+    private const string VersionLabel = "v0.11.6";
     private static readonly string[] CommandNames = ["/kwc", "/가방"];
 
     private static readonly Vector4 ColorOk = new(0.60f, 0.90f, 0.60f, 1f);
@@ -471,6 +471,28 @@ public sealed class Plugin : IDalamudPlugin
         if (ImGui.Checkbox("옷장 자동 다시 열기##s2reopen", ref reopen)) { config.Stage2AutoReopenDresser = reopen; SaveConfig(); }
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("장비함 조각이 있으면 옷장을 잠시 닫고 가방으로 옮긴 뒤, 근처의 환상의 옷장과 상호작용해 다시 엽니다. 끄면 옮긴 뒤 직접 열어 주세요(열리면 자동으로 이어서 저장).");
+
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextUnformatted("단벌 맡기기 방식");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(230);
+        var methodLabel = config.Stage2SingleMethod switch { 1 => "에이전트 플래그", 2 => "콜백 값 직접 지정", _ => "기록된 콜백 (권장)" };
+        if (ImGui.BeginCombo("##s2method", methodLabel))
+        {
+            if (ImGui.Selectable("기록된 콜백 (권장)", config.Stage2SingleMethod == 0)) { config.Stage2SingleMethod = 0; SaveConfig(); }
+            if (ImGui.Selectable("에이전트 플래그", config.Stage2SingleMethod == 1)) { config.Stage2SingleMethod = 1; SaveConfig(); }
+            if (ImGui.Selectable("콜백 값 직접 지정", config.Stage2SingleMethod == 2)) { config.Stage2SingleMethod = 2; SaveConfig(); }
+            ImGui.EndCombo();
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("기록된 콜백: 손으로 맡길 때 게임이 보내는 값(14, 행, 0)을 그대로 보냅니다.\n에이전트 플래그: 목록 선택 인덱스와 맡기기 대기 플래그를 직접 써서 게임이 확인 창을 띄우게 합니다.\n직접 지정: '콜백 기록'으로 얻은 값을 입력합니다. u 접두어는 uint, {row}는 목록 행 번호.");
+        if (config.Stage2SingleMethod == 2)
+        {
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(180);
+            var cb = config.Stage2SingleCallback;
+            if (ImGui.InputTextWithHint("##s2cb", "예: u14,{row},u0", ref cb, 64)) { config.Stage2SingleCallback = cb; SaveConfig(); }
+        }
 
         if (PrimaryButton($"기존 세트에만 넣기 ({stage2.Selected.Count}개)##s2go1") && CanStart(stage2.IsRunning))
             stage2.StartExistingSetsOnly();

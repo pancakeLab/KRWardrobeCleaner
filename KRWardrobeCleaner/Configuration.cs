@@ -14,6 +14,10 @@ public sealed class Configuration : IPluginConfiguration
     public bool Stage2IncludeMateria { get; set; }
     /// 장비함 조각을 가방으로 옮기기 위해 옷장을 닫았다가, 근처 옷장 오브젝트와 상호작용해 자동으로 다시 연다.
     public bool Stage2AutoReopenDresser { get; set; } = true;
+    /// 단벌 맡기기 방식. 0 = 기록된 콜백 (14, 행, 0) [권장], 1 = 에이전트 선택 인덱스 + 맡기기 대기 플래그, 2 = 콜백 값 직접 지정.
+    public int Stage2SingleMethod { get; set; }
+    /// 방식 2에서 보낼 콜백 값. 쉼표 구분, u 접두어 = uint, {row} = 목록 행 번호. 예: u14,{row},u0
+    public string Stage2SingleCallback { get; set; } = "u14,{row},u0";
 
     public bool Stage4SmartIncludeCrafterGatherer { get; set; }
     public int Stage4SmartMaxLevel { get; set; } = 100;

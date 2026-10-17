@@ -109,6 +109,9 @@ public sealed unsafe class Stage2InventoryToDresser
     private const int ListWaitMs = 2500;           // wait for the game deposit list to show a bag item
     private const int ListRefreshAfterMs = 800;    // ask the game to rebuild the list after this long
     private const int DresserGraceMs = 2000;        // how long the dresser may look 'not ready' (dialog, relayout) before we stop
+    private const int CrystallizeActionPendingOffset = 0x11AE7D; // MiragePrismPrismBoxData: when set, the agent opens the deposit confirm for CrystallizeItemIndex
+    private const int ConfirmAppearMs = 4000;        // how long we wait for the deposit confirm dialog before giving up on the item
+    private const uint DepositRowCallback = 14;      // recorded from a manual deposit: Crystallize [uint 14, uint row, uint 0], close=true
 
     private readonly ExcelIndex excel;
     private readonly InventoryScanner scanner;
@@ -139,6 +142,7 @@ public sealed unsafe class Stage2InventoryToDresser
     private bool listRefreshRequested;
     private long confirmStartedAt;
     private long notReadySince;
+    private int singleConfirmMisses;
     private string? lastPromptLogged;
 
     private PrestageState? prestage;
@@ -453,6 +457,7 @@ public sealed unsafe class Stage2InventoryToDresser
 
         Stored = Failed = 0;
         Skipped = skippedBlocked;
+        singleConfirmMisses = 0;
         Total = setQueue.Sum(b => b.Pieces.Count) + singleQueue.Count + skippedBlocked;
         LastItemStatus = skippedBlocked > 0 ? $"조건 미달(수리/마테리아) {skippedBlocked}개는 제외했습니다." : null;
         IsRunning = true;
@@ -1296,7 +1301,7 @@ public sealed unsafe class Stage2InventoryToDresser
                     return;
                 }
 
-                if (!FireCallback("MiragePrismPrismBoxCrystallize", 0, row))
+                if (!RequestSingleDeposit(data, row))
                     return;
 
                 confirmStartedAt = now;
@@ -1324,12 +1329,93 @@ public sealed unsafe class Stage2InventoryToDresser
 
             case SingleStoreState.Confirm:
                 if (TryConfirmYesNoForItem(entry.Name, now - confirmStartedAt))
+                {
+                    singleConfirmMisses = 0;
                     singleState = SingleStoreState.Wait;
+                    return;
+                }
+
+                if (now - confirmStartedAt > ConfirmAppearMs)
+                {
+                    Failed++;
+                    singleConfirmMisses++;
+                    LastItemStatus = $"{entry.Name}: 맡기기 확인 창이 뜨지 않았습니다.";
+                    log.Warning("[KWC] s2 single: no deposit confirm appeared for {Name} {Loc} (method={Method}, misses={Misses})", entry.Name, entry.Key.Id, config.Stage2SingleMethod, singleConfirmMisses);
+                    FinishSingle();
+                    if (singleConfirmMisses >= 2)
+                        Stop("단벌 맡기기 요청에 게임이 반응하지 않습니다. 상단의 '콜백 기록'을 켜고 아이템 하나를 손으로 맡긴 뒤 로그의 [KWC] callback 값을 '콜백 값 직접 지정'에 넣어 주세요.");
+                }
                 return;
 
             case SingleStoreState.Wait:
                 return;
         }
+    }
+
+    /// Asks the game to deposit one row of its own deposit list. Never fires callback (0,row): the recorder
+    /// showed the game answers that with -2 (close) on both dresser windows.
+    private bool RequestSingleDeposit(MiragePrismPrismBoxData* data, int row)
+    {
+        switch (config.Stage2SingleMethod)
+        {
+            case 1:
+                data->CrystallizeItemIndex = (ushort)row;
+                *((byte*)data + CrystallizeActionPendingOffset) = 1;
+                Debug("s2 single deposit via agent flag: CrystallizeItemIndex={Row}", row);
+                return true;
+
+            case 2:
+            {
+                var values = ParseCallbackValues(config.Stage2SingleCallback, row);
+                if (values == null)
+                {
+                    Stop("'콜백 값 직접 지정'이 비어 있거나 형식이 잘못되었습니다. 예: u14,{row},u0");
+                    return false;
+                }
+
+                Debug("s2 single deposit via custom callback [{Values}] (row {Row})", string.Join(",", values.Select(v => (v.IsUInt ? "u" : "") + v.Value)), row);
+                return FireCallbackTyped("MiragePrismPrismBoxCrystallize", true, values);
+            }
+
+            default:
+                Debug("s2 single deposit via recorded callback [u{A}, u{Row}, u0] close=true", DepositRowCallback, row);
+                return FireCallbackTyped("MiragePrismPrismBoxCrystallize", true, [(true, (int)DepositRowCallback), (true, row), (true, 0)]);
+        }
+    }
+
+    /// "u14,{row},u0" -> [(uint)14, (uint)row, (uint)0]; a value without the u prefix is sent as int.
+    private static List<(bool IsUInt, int Value)>? ParseCallbackValues(string? text, int row)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        var parts = text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length == 0) return null;
+        var values = new List<(bool, int)>();
+        foreach (var raw in parts)
+        {
+            var part = raw;
+            var isUInt = part.StartsWith("u", StringComparison.OrdinalIgnoreCase);
+            if (isUInt) part = part[1..];
+            if (part.Equals("{row}", StringComparison.OrdinalIgnoreCase)) values.Add((isUInt, row));
+            else if (int.TryParse(part, out var v)) values.Add((isUInt, v));
+            else return null;
+        }
+        return values;
+    }
+
+    private bool FireCallbackTyped(string addonName, bool close, IReadOnlyList<(bool IsUInt, int Value)> values)
+    {
+        var addon = (AtkUnitBase*)gameGui.GetAddonByName(addonName).Address;
+        if (addon == null || !addon->IsVisible || !addon->IsReady)
+            return false;
+
+        var atk = stackalloc AtkValue[values.Count];
+        for (var i = 0; i < values.Count; i++)
+        {
+            if (values[i].IsUInt) atk[i].SetUInt((uint)values[i].Value);
+            else atk[i].SetInt(values[i].Value);
+        }
+        addon->FireCallback((uint)values.Count, atk, close);
+        return true;
     }
 
     private void FinishSingle()
