@@ -10,7 +10,7 @@ namespace KRWardrobeCleaner;
 
 public sealed class Plugin : IDalamudPlugin
 {
-    private const string VersionLabel = "v0.11.3";
+    private const string VersionLabel = "v0.11.4";
     private static readonly string[] CommandNames = ["/kwc", "/가방"];
 
     private static readonly Vector4 ColorOk = new(0.60f, 0.90f, 0.60f, 1f);
@@ -427,7 +427,7 @@ public sealed class Plugin : IDalamudPlugin
 
     private void DrawStage2()
     {
-        Help("장비함과 가방에서 환상의 옷장에 넣을 수 있는 장비를 찾아, 기존 의상 세트 보충 → 세트 우선 저장 → 단벌 저장 순으로 넣습니다. 환상의 옷장과 '아이템 맡기기' 목록을 연 상태에서 쓰세요. 내구도 100% 미만은 게임이 받지 않아 자동 제외합니다. 게임은 가방에 있는 장비만 맡길 수 있고 옷장이 열린 동안은 장비함에서 꺼낼 수도 없어서, 장비함 장비가 있으면 옷장을 잠시 닫고 가방으로 옮긴 뒤 옷장을 다시 열어 이어서 넣습니다(가방 빈칸 필요).");
+        Help("장비함과 가방에서 환상의 옷장에 넣을 수 있는 장비를 찾아, 기존 의상 세트 보충 → 세트 우선 저장 → 단벌 저장 순으로 넣습니다. 환상의 옷장과 '아이템 맡기기' 목록을 연 상태에서 쓰세요. 내구도 100% 미만은 게임이 받지 않아 자동 제외합니다. 게임은 가방에 있는 장비만 맡길 수 있고 옷장이 열린 동안은 장비함에서 꺼낼 수도 없어서, 가방에 있는 장비를 먼저 다 넣은 뒤, 장비함 장비는 옷장을 잠시 닫고 가방으로 옮겨 다시 열어 넣기를 빈칸이 생기는 만큼 반복합니다.");
 
         var running = stage2.IsRunning;
         if (running) ImGui.BeginDisabled();

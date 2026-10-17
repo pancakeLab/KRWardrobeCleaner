@@ -454,8 +454,8 @@ public sealed unsafe class Stage2InventoryToDresser
         Total = setQueue.Sum(b => b.Pieces.Count) + singleQueue.Count + skippedBlocked;
         LastItemStatus = skippedBlocked > 0 ? $"조건 미달(수리/마테리아) {skippedBlocked}개는 제외했습니다." : null;
         IsRunning = true;
-        Status = $"저장 시작: 세트 작업 {setQueue.Count}개 · 단벌 {singleQueue.Count}개.";
-        PlanPrestage();
+        DeferArmoryWork();
+        Status = $"저장 시작: 가방에서 바로 넣을 세트 {setQueue.Count}개 · 단벌 {singleQueue.Count}개, 장비함에서 꺼낸 뒤 넣을 조각 {DeferredCount}개.";
         return true;
     }
 
@@ -529,6 +529,19 @@ public sealed unsafe class Stage2InventoryToDresser
             return;
         }
 
+        if (DeferredCount > 0)
+        {
+            if (BeginRound())
+                return;
+
+            var dropped = DeferredCount;
+            Skipped += dropped;
+            plannedSets = [];
+            plannedSingles = [];
+            LastItemStatus = $"가방 빈칸이 없어 장비함 조각 {dropped}개는 넣지 못했습니다. 가방을 비운 뒤 다시 실행해 주세요.";
+            Debug("s2 rounds finished with {Dropped} armoury pieces left (no free bag slot)", dropped);
+        }
+
         IsRunning = false;
         var completed = $"완료: 저장 {Stored} · 제외 {Skipped} · 실패 {Failed}";
         Scan();
@@ -559,53 +572,77 @@ public sealed unsafe class Stage2InventoryToDresser
         public int Total;
         public long ClosedAt;
         public long ReadySince;
+        public long LastWaitLog;
     }
 
     public bool IsPrestaging => prestage != null;
 
-    private void PlanPrestage()
+    /// Work that still needs armoury pieces is deferred: everything already in the bags is stored first
+    /// (which frees bag space), then rounds of "close dresser → move pieces → reopen" bring the armoury
+    /// pieces in. Set batches are moved as a whole so a set is never split across rounds.
+    private void DeferArmoryWork()
     {
-        var armory = new Dictionary<ItemLocationKey, PhysicalGearEntry>();
+        plannedSets = [];
+        plannedSingles = [];
+
+        var keepSets = new List<SetBatch>();
         foreach (var b in setQueue)
-            foreach (var p in b.Pieces)
-                if (IsArmory(p.Entry.Key.Container))
-                    armory.TryAdd(p.Entry.Key, p.Entry);
-        foreach (var s in singleQueue)
-            if (IsArmory(s.Key.Container))
-                armory.TryAdd(s.Key, s);
-        if (armory.Count == 0)
-            return;
-
-        plannedSets = setQueue.ToList();
-        plannedSingles = singleQueue.ToList();
-        setQueue.Clear();
-        singleQueue.Clear();
-
-        var free = scanner.CountFreeBagSlots();
-        if (free == 0)
         {
-            RebuildQueuesAfterPrestage([]);
-            LastItemStatus = $"가방 빈칸이 없어 장비함 조각 {armory.Count}개는 이번에 넣지 않습니다. 가방을 비우거나 3번 탭으로 먼저 옮겨 주세요.";
-            Debug("s2 prestage skipped: no free bag slot, {Count} armoury pieces dropped", armory.Count);
-            return;
+            if (b.Pieces.Any(p => IsArmory(p.Entry.Key.Container))) plannedSets.Add(b);
+            else keepSets.Add(b);
+        }
+        setQueue.Clear();
+        foreach (var b in keepSets) setQueue.Enqueue(b);
+
+        var keepSingles = new List<PhysicalGearEntry>();
+        foreach (var s in singleQueue)
+        {
+            if (IsArmory(s.Key.Container)) plannedSingles.Add(s);
+            else keepSingles.Add(s);
+        }
+        singleQueue.Clear();
+        foreach (var s in keepSingles) singleQueue.Enqueue(s);
+
+        if (DeferredCount > 0)
+            Debug("s2 deferred armoury work: sets={Sets} singles={Singles} (bag work first: sets={BagSets} singles={BagSingles})",
+                plannedSets.Count, plannedSingles.Count, setQueue.Count, singleQueue.Count);
+    }
+
+    public int DeferredCount => plannedSets.Sum(b => b.Pieces.Count) + plannedSingles.Count;
+
+    /// Starts one close → move → reopen round for as many deferred pieces as the bags can take.
+    /// Returns false when nothing fits (no free bag slot).
+    private bool BeginRound()
+    {
+        var free = scanner.CountFreeBagSlots();
+        var state = new PrestageState { PhaseAt = Environment.TickCount64, DresserObjectId = FindDresserObjectId() };
+        var remaining = free;
+
+        foreach (var b in plannedSets)
+        {
+            var pieces = b.Pieces.Where(p => IsArmory(p.Entry.Key.Container)).Select(p => p.Entry).ToList();
+            if (pieces.Count == 0 || pieces.Count > remaining) continue;
+            foreach (var e in pieces) state.ToMove.Enqueue(e);
+            remaining -= pieces.Count;
         }
 
-        var state = new PrestageState { PhaseAt = Environment.TickCount64, DresserObjectId = FindDresserObjectId() };
-        foreach (var e in armory.Values)
+        foreach (var s in plannedSingles)
         {
-            if (state.ToMove.Count >= free) break;
-            state.ToMove.Enqueue(e);
+            if (remaining <= 0) break;
+            state.ToMove.Enqueue(s);
+            remaining--;
         }
 
         state.Total = state.ToMove.Count;
-        var dropped = armory.Count - state.Total;
-        if (dropped > 0)
-            LastItemStatus = $"가방 빈칸이 {free}칸뿐이라 장비함 조각 {dropped}개는 이번에 넣지 않습니다.";
+        if (state.Total == 0)
+            return false;
 
         prestage = state;
         CloseDresser();
-        Status = $"장비함 조각 {state.Total}개를 가방으로 옮기기 위해 환상의 옷장을 잠시 닫습니다…";
-        Debug("s2 prestage: {Count} armoury pieces to move (dropped {Dropped}), dresser object {Obj}", state.Total, dropped, state.DresserObjectId);
+        Status = $"가방 아이템은 다 넣었습니다. 장비함 조각 {state.Total}개를 가방으로 옮기기 위해 환상의 옷장을 잠시 닫습니다… (장비함 대기 {DeferredCount}개)";
+        Debug("s2 round: moving {Count} of {Deferred} deferred armoury pieces (free bag slots {Free}), dresser object {Obj}",
+            state.Total, DeferredCount, free, state.DresserObjectId);
+        return true;
     }
 
     private void TickPrestage()
@@ -724,7 +761,7 @@ public sealed unsafe class Stage2InventoryToDresser
                 {
                     st.ReopenRequested = true;
                     st.ReopenAttempts++;
-                    Status = $"장비함 조각 {st.Moved.Count}개를 가방으로 옮겼습니다. 환상의 옷장을 다시 여는 중…";
+                    Status = $"장비함 조각 {st.Moved.Count}개를 가방으로 옮겼습니다. 환상의 옷장을 다시 여는 중… (장비함 대기 {DeferredCount}개)";
                 }
                 else
                 {
@@ -736,6 +773,15 @@ public sealed unsafe class Stage2InventoryToDresser
                 return;
 
             case PrestagePhase.WaitDresser:
+                if (now - st.LastWaitLog > 2000)
+                {
+                    st.LastWaitLog = now;
+                    var mm = MirageManager.Instance();
+                    Debug("s2 prestage waiting: prismBoxLoaded={Loaded} dresserWindow={Box} depositList={List} occupied={Occ}",
+                        mm != null && mm->PrismBoxLoaded, IsAddonVisible("MiragePrismPrismBox"), IsAddonVisible("MiragePrismPrismBoxCrystallize"),
+                        condition[ConditionFlag.OccupiedInEvent] || condition[ConditionFlag.OccupiedInQuestEvent] || condition[ConditionFlag.Occupied]);
+                }
+
                 if (!IsDresserReady())
                     st.ReadySince = 0;
                 else if (st.ReadySince == 0)
@@ -765,36 +811,44 @@ public sealed unsafe class Stage2InventoryToDresser
         }
     }
 
+    /// Re-queues the deferred work whose armoury pieces were moved in this round; the rest stays deferred.
     private void RebuildQueuesAfterPrestage(Dictionary<ItemLocationKey, ItemLocationKey> moved)
     {
-        PhysicalGearEntry? Remap(PhysicalGearEntry e)
-        {
-            if (!IsArmory(e.Key.Container)) return e;
-            return moved.TryGetValue(e.Key, out var dest) ? e with { Key = dest } : null;
-        }
+        SetPiece Remap(SetPiece p) => moved.TryGetValue(p.Entry.Key, out var d) ? p with { Entry = p.Entry with { Key = d } } : p;
 
+        var stillSets = new List<SetBatch>();
         foreach (var b in plannedSets)
         {
-            var pieces = new List<SetPiece>();
-            foreach (var p in b.Pieces)
+            var armory = b.Pieces.Where(p => IsArmory(p.Entry.Key.Container)).ToList();
+            var movedCount = armory.Count(p => moved.ContainsKey(p.Entry.Key));
+            if (movedCount == 0)
             {
-                var e = Remap(p.Entry);
-                if (e is null) { Skipped++; continue; }
-                pieces.Add(p with { Entry = e });
+                stillSets.Add(b);
+                continue;
+            }
+
+            // Batches are moved as a whole; a piece can only be missing here when its move failed.
+            var pieces = b.Pieces.Where(p => !IsArmory(p.Entry.Key.Container) || moved.ContainsKey(p.Entry.Key)).Select(Remap).ToList();
+            var lost = armory.Count - movedCount;
+            if (lost > 0)
+            {
+                Skipped += lost;
+                Debug("s2 round: set '{Set}' lost {Lost} pieces whose move failed", b.Set.Name, lost);
             }
 
             if (pieces.Count >= 1) setQueue.Enqueue(new SetBatch(b.Set, pieces, b.ExistingIndex, b.FallbackToSingles));
         }
+        plannedSets = stillSets;
 
+        var stillSingles = new List<PhysicalGearEntry>();
         foreach (var s in plannedSingles)
         {
-            var e = Remap(s);
-            if (e is null) { Skipped++; continue; }
-            singleQueue.Enqueue(e);
+            if (moved.TryGetValue(s.Key, out var d)) singleQueue.Enqueue(s with { Key = d });
+            else stillSingles.Add(s);
         }
+        plannedSingles = stillSingles;
 
-        plannedSets = [];
-        plannedSingles = [];
+        Debug("s2 round: queued sets={Sets} singles={Singles}, still deferred {Deferred}", setQueue.Count, singleQueue.Count, DeferredCount);
     }
 
     private void CloseDresser()
