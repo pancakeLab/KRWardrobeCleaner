@@ -110,7 +110,9 @@ public sealed unsafe class Stage2InventoryToDresser
     private const int ListRefreshAfterMs = 800;    // ask the game to rebuild the list after this long
     private const int DresserGraceMs = 2000;        // how long the dresser may look 'not ready' (dialog, relayout) before we stop
     private const int CrystallizeActionPendingOffset = 0x11AE7D; // MiragePrismPrismBoxData: when set, the agent opens the deposit confirm for CrystallizeItemIndex
-    private const int ConfirmAppearMs = 4000;        // how long we wait for the deposit confirm dialog before giving up on the item
+    private const int ConfirmAppearMs = 6000;        // how long we wait for the deposit confirm dialog before giving up on the item
+    private const int ConfirmByTimingMs = 250;       // a dialog that opens this long after our request is ours even if its text is unreadable
+    private const int ConfirmMissLimit = 3;          // consecutive unanswered dialogs before the run stops
     private const uint DepositRowCallback = 14;      // recorded from a manual deposit: Crystallize [uint 14, uint row, uint 0], close=true
 
     private readonly ExcelIndex excel;
@@ -143,6 +145,8 @@ public sealed unsafe class Stage2InventoryToDresser
     private long confirmStartedAt;
     private long notReadySince;
     private int singleConfirmMisses;
+    private bool yesNoOpenAtRequest;
+    private long staleYesNoSince;
     private string? lastPromptLogged;
 
     private PrestageState? prestage;
@@ -458,6 +462,8 @@ public sealed unsafe class Stage2InventoryToDresser
         Stored = Failed = 0;
         Skipped = skippedBlocked;
         singleConfirmMisses = 0;
+        staleYesNoSince = 0;
+        yesNoOpenAtRequest = false;
         Total = setQueue.Sum(b => b.Pieces.Count) + singleQueue.Count + skippedBlocked;
         LastItemStatus = skippedBlocked > 0 ? $"조건 미달(수리/마테리아) {skippedBlocked}개는 제외했습니다." : null;
         IsRunning = true;
@@ -892,8 +898,8 @@ public sealed unsafe class Stage2InventoryToDresser
         var mm = MirageManager.Instance();
         var box = (AtkUnitBase*)gameGui.GetAddonByName("MiragePrismPrismBox").Address;
         var list = (AtkUnitBase*)gameGui.GetAddonByName("MiragePrismPrismBoxCrystallize").Address;
-        var yesno = (AddonSelectYesno*)gameGui.GetAddonByName("SelectYesno").Address;
-        var prompt = yesno != null && yesno->AtkUnitBase.IsVisible && yesno->PromptText != null ? yesno->PromptText->NodeText.ToString().Replace("\n", " ") : "-";
+        var yesno = FindOpenYesNo();
+        var prompt = yesno == null ? "-" : YesNoPrompt.Flatten(YesNoPrompt.Read(yesno, out _));
         Debug("s2 state ({Why}): prismBoxLoaded={Loaded} dresserWindow={BoxVis}/{BoxReady} depositList={ListVis}/{ListReady} yesno=\"{Prompt}\" single={State}",
             why, mm != null && mm->PrismBoxLoaded,
             box != null && box->IsVisible, box != null && box->IsReady,
@@ -1200,6 +1206,7 @@ public sealed unsafe class Stage2InventoryToDresser
         if (singleState is SingleStoreState.Confirm or SingleStoreState.Wait && !scanner.TryResolve(entry.Key, entry.ItemId, out _))
         {
             Stored++;
+            singleConfirmMisses = 0;
             LastItemStatus = $"{entry.Name}: 인벤토리에서 사라져 저장 완료로 확인했습니다.";
             Debug("s2 single stored {Name} {Loc}", entry.Name, entry.Key.Id);
             FinishSingle();
@@ -1301,6 +1308,10 @@ public sealed unsafe class Stage2InventoryToDresser
                     return;
                 }
 
+                if (HandleStaleYesNo(now))
+                    return;
+
+                yesNoOpenAtRequest = FindOpenYesNo() != null;
                 if (!RequestSingleDeposit(data, row))
                     return;
 
@@ -1342,8 +1353,8 @@ public sealed unsafe class Stage2InventoryToDresser
                     LastItemStatus = $"{entry.Name}: 맡기기 확인 창이 뜨지 않았습니다.";
                     log.Warning("[KWC] s2 single: no deposit confirm appeared for {Name} {Loc} (method={Method}, misses={Misses})", entry.Name, entry.Key.Id, config.Stage2SingleMethod, singleConfirmMisses);
                     FinishSingle();
-                    if (singleConfirmMisses >= 2)
-                        Stop("단벌 맡기기 요청에 게임이 반응하지 않습니다. 상단의 '콜백 기록'을 켜고 아이템 하나를 손으로 맡긴 뒤 로그의 [KWC] callback 값을 '콜백 값 직접 지정'에 넣어 주세요.");
+                    if (singleConfirmMisses >= ConfirmMissLimit)
+                        Stop("단벌 맡기기 확인 창을 연속으로 처리하지 못해 멈췄습니다. 상단의 '디버그 로그'를 켠 채 다시 실행한 뒤 /xllog 의 [KWC] s2 yes/no 줄을 알려 주세요.");
                 }
                 return;
 
@@ -1528,39 +1539,77 @@ public sealed unsafe class Stage2InventoryToDresser
         return true;
     }
 
-    /// Confirms the deposit prompt. Prefers a prompt that names the item; after a short grace period a
-    /// deposit prompt ("맡기") that appeared for our request is accepted too. Unmatched prompts are logged.
-    private bool TryConfirmYesNoForItem(string expectedItemName, long elapsedMs)
+    /// Finds the first open yes/no dialog (the game can stack a few instances).
+    private AddonSelectYesno* FindOpenYesNo()
     {
         for (var i = 1; i <= 4; i++)
         {
             var yesno = (AddonSelectYesno*)gameGui.GetAddonByName("SelectYesno", i).Address;
-            if (yesno == null || !yesno->AtkUnitBase.IsVisible || !yesno->AtkUnitBase.IsReady)
-                continue;
+            if (YesNoPrompt.IsOpen(yesno))
+                return yesno;
+        }
+        return null;
+    }
 
-            var prompt = yesno->PromptText == null ? string.Empty : yesno->PromptText->NodeText.ToString();
-            if (string.IsNullOrWhiteSpace(prompt))
-                continue;
+    /// A dialog left over from an earlier request (one we failed to recognise) must be dealt with before the
+    /// next deposit request: firing the next request while it is open makes the game cancel it (-2).
+    /// A dresser prompt is answered Yes (it stores that earlier item); anything else is left to the player.
+    private bool HandleStaleYesNo(long now)
+    {
+        var yesno = FindOpenYesNo();
+        if (yesno == null)
+        {
+            staleYesNoSince = 0;
+            return false;
+        }
 
-            var byName = prompt.Contains(expectedItemName, StringComparison.OrdinalIgnoreCase);
-            var byKeyword = elapsedMs > 600 && prompt.Contains("맡기", StringComparison.Ordinal);
-            if (!byName && !byKeyword)
-            {
-                if (lastPromptLogged != prompt)
-                {
-                    lastPromptLogged = prompt;
-                    Debug("s2 yes/no prompt not matched for {Name}: \"{Prompt}\"", expectedItemName, prompt.Replace("\n", " "));
-                }
-                continue;
-            }
-
-            Debug("s2 confirm {Name} via {How}: \"{Prompt}\"", expectedItemName, byName ? "name" : "keyword", prompt.Replace("\n", " "));
-            yesno->AtkUnitBase.FireCallbackInt(0);
+        var prompt = YesNoPrompt.Read(yesno, out var source);
+        if (YesNoPrompt.LooksLikeDresserPrompt(prompt))
+        {
+            log.Information("[KWC] s2 yes/no: answering a leftover dresser prompt ({Source}): \"{Prompt}\"", source, YesNoPrompt.Flatten(prompt));
+            YesNoPrompt.Yes(yesno);
+            staleYesNoSince = 0;
             return true;
         }
 
-        return false;
+        if (staleYesNoSince == 0)
+        {
+            staleYesNoSince = now;
+            log.Information("[KWC] s2 yes/no: a dialog is open before the next request, waiting for it to close ({Source}): \"{Prompt}\"", source, YesNoPrompt.Flatten(prompt));
+            LastItemStatus = "다른 확인 창이 열려 있어 닫히기를 기다립니다.";
+        }
+        return true;
     }
+
+    /// Confirms the deposit prompt. Matches by item name or dresser wording; a dialog that was not open when
+    /// we sent the request and appears shortly after is accepted on timing alone (the KR client's prompt text
+    /// could not be read through the PromptText node, so wording is not required). Every decision is logged.
+    private bool TryConfirmYesNoForItem(string expectedItemName, long elapsedMs)
+    {
+        var yesno = FindOpenYesNo();
+        if (yesno == null)
+            return false;
+
+        var prompt = YesNoPrompt.Read(yesno, out var source);
+        var byName = !string.IsNullOrEmpty(prompt) && prompt.Contains(expectedItemName, StringComparison.OrdinalIgnoreCase);
+        var byKeyword = !string.IsNullOrEmpty(prompt) && YesNoPrompt.LooksLikeDresserPrompt(prompt);
+        var byTiming = !yesNoOpenAtRequest && elapsedMs >= ConfirmByTimingMs;
+        if (!byName && !byKeyword && !byTiming)
+        {
+            if (lastPromptLogged != prompt)
+            {
+                lastPromptLogged = prompt;
+                log.Information("[KWC] s2 yes/no prompt not matched for {Name} ({Source}, open-at-request={Stale}, {Elapsed}ms): \"{Prompt}\"",
+                    expectedItemName, source, yesNoOpenAtRequest, elapsedMs, YesNoPrompt.Flatten(prompt));
+            }
+            return false;
+        }
+
+        var how = byName ? "name" : byKeyword ? "keyword" : "timing";
+        log.Information("[KWC] s2 confirm {Name} via {How} ({Source}, {Elapsed}ms): \"{Prompt}\"", expectedItemName, how, source, elapsedMs, YesNoPrompt.Flatten(prompt));
+        return YesNoPrompt.Yes(yesno);
+    }
+
 
     private void Debug(string template, params object[] args)
     {

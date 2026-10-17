@@ -732,12 +732,12 @@ public sealed unsafe class Stage4Discard
             if (yesno == null || !yesno->AtkUnitBase.IsVisible)
                 continue;
 
-            var prompt = yesno->PromptText == null ? string.Empty : yesno->PromptText->NodeText.ToString();
+            var prompt = YesNoPrompt.Read(yesno, out _);
             if (string.IsNullOrWhiteSpace(prompt) ||
                 !prompt.Contains(expected.Name, StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            yesno->AtkUnitBase.FireCallbackInt(0);
+            YesNoPrompt.Yes(yesno);
             return;
         }
     }
