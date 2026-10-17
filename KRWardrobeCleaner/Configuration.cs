@@ -12,6 +12,8 @@ public sealed class Configuration : IPluginConfiguration
     public bool Stage2IncludeDyed { get; set; }
     /// 마테리아가 장착된 장비도 환상의 옷장 저장을 시도한다(게임이 거절할 수 있음). 기본 꺼짐.
     public bool Stage2IncludeMateria { get; set; }
+    /// 장비함 조각을 가방으로 옮기기 위해 옷장을 닫았다가, 근처 옷장 오브젝트와 상호작용해 자동으로 다시 연다.
+    public bool Stage2AutoReopenDresser { get; set; } = true;
 
     public bool Stage4SmartIncludeCrafterGatherer { get; set; }
     public int Stage4SmartMaxLevel { get; set; } = 100;

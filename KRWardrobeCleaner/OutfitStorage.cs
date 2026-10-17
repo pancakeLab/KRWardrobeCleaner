@@ -1,4 +1,7 @@
+using System.Numerics;
+using Dalamud.Game.ClientState.Objects.Types;
 using Dalamud.Plugin.Services;
+using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
@@ -109,6 +112,7 @@ public sealed unsafe class Stage2InventoryToDresser
     private readonly InventoryScanner scanner;
     private readonly OutfitCatalog outfits;
     private readonly IGameGui gameGui;
+    private readonly IObjectTable objects;
     private readonly IPluginLog log;
     private readonly Configuration config;
     private readonly System.Action saveConfig;
@@ -133,6 +137,10 @@ public sealed unsafe class Stage2InventoryToDresser
     private long confirmStartedAt;
     private string? lastPromptLogged;
 
+    private PrestageState? prestage;
+    private List<SetBatch> plannedSets = [];
+    private List<PhysicalGearEntry> plannedSingles = [];
+
     private SetBatch? stagingBatch;
     private List<SetPiece> stagedPieces = [];
     private readonly Queue<SetPiece> stagingToMove = new();
@@ -152,10 +160,11 @@ public sealed unsafe class Stage2InventoryToDresser
     public string Status { get; private set; } = "환상의 옷장을 연 뒤 후보를 검색해 주세요.";
     public string? LastItemStatus { get; private set; }
 
-    public Stage2InventoryToDresser(ExcelIndex excel, InventoryScanner scanner, OutfitCatalog outfits, GearFilter filter, IGameGui gameGui, IPluginLog log, Configuration config, System.Action saveConfig)
+    public Stage2InventoryToDresser(ExcelIndex excel, InventoryScanner scanner, OutfitCatalog outfits, GearFilter filter, IGameGui gameGui, IObjectTable objects, IPluginLog log, Configuration config, System.Action saveConfig)
     {
         this.excel = excel;
         this.filter = filter;
+        this.objects = objects;
         this.scanner = scanner;
         this.outfits = outfits;
         this.gameGui = gameGui;
@@ -327,6 +336,7 @@ public sealed unsafe class Stage2InventoryToDresser
     }
 
     public bool StartExistingSetsOnly() => Start(storeRemainingSingles: false, existingOnly: true);
+    public bool StartSetsOnly() => Start(storeRemainingSingles: false, existingOnly: false);
     public bool StartSetsThenSingles() => Start(storeRemainingSingles: true, existingOnly: false);
 
     private bool Start(bool storeRemainingSingles, bool existingOnly)
@@ -438,12 +448,16 @@ public sealed unsafe class Stage2InventoryToDresser
         LastItemStatus = skippedBlocked > 0 ? $"조건 미달(수리/마테리아) {skippedBlocked}개는 제외했습니다." : null;
         IsRunning = true;
         Status = $"저장 시작: 세트 작업 {setQueue.Count}개 · 단벌 {singleQueue.Count}개.";
+        PlanPrestage();
         return true;
     }
 
     public void Stop(string reason = "2단계 작업을 중지했습니다.")
     {
         IsRunning = false;
+        prestage = null;
+        plannedSets = [];
+        plannedSingles = [];
         pendingBatch = null;
         stagingBatch = null;
         stagingMove = null;
@@ -456,6 +470,12 @@ public sealed unsafe class Stage2InventoryToDresser
     public void Tick()
     {
         if (!IsRunning) return;
+        if (prestage is not null)
+        {
+            TickPrestage();
+            return;
+        }
+
         if (!IsDresserReady())
         {
             Stop("환상의 옷장 또는 아이템 맡기기 목록이 닫혀 작업을 중지했습니다.");
@@ -504,6 +524,296 @@ public sealed unsafe class Stage2InventoryToDresser
         var completed = $"완료: 저장 {Stored} · 제외 {Skipped} · 실패 {Failed}";
         Scan();
         Status = completed;
+    }
+
+    // ---- pre-stage: the game refuses armoury -> bag moves while the dresser is open (MoveItemSlot rc=10,
+    // "이벤트 중"), so the dresser is closed first, every armoury piece is moved into the bags, and the
+    // dresser is reopened by interacting with the nearby dresser object. Storing then continues as usual.
+
+    private const uint GlamourDresserEObj = 2009439;   // EObjName "환상의 옷장"
+    private const int PrestageMoveIntervalMs = 350;
+    private const int ReopenRetryMs = 8000;
+
+    private enum PrestagePhase { Closing, Moving, Reopen, WaitDresser }
+
+    private sealed class PrestageState
+    {
+        public PrestagePhase Phase = PrestagePhase.Closing;
+        public long PhaseAt;
+        public int CloseAttempts;
+        public readonly Queue<PhysicalGearEntry> ToMove = new();
+        public readonly Dictionary<ItemLocationKey, ItemLocationKey> Moved = [];
+        public (PhysicalGearEntry Entry, ItemLocationKey Dest, long At)? Current;
+        public ulong DresserObjectId;
+        public bool ReopenRequested;
+        public int ReopenAttempts;
+        public int Total;
+    }
+
+    public bool IsPrestaging => prestage != null;
+
+    private void PlanPrestage()
+    {
+        var armory = new Dictionary<ItemLocationKey, PhysicalGearEntry>();
+        foreach (var b in setQueue)
+            foreach (var p in b.Pieces)
+                if (IsArmory(p.Entry.Key.Container))
+                    armory.TryAdd(p.Entry.Key, p.Entry);
+        foreach (var s in singleQueue)
+            if (IsArmory(s.Key.Container))
+                armory.TryAdd(s.Key, s);
+        if (armory.Count == 0)
+            return;
+
+        plannedSets = setQueue.ToList();
+        plannedSingles = singleQueue.ToList();
+        setQueue.Clear();
+        singleQueue.Clear();
+
+        var state = new PrestageState { PhaseAt = Environment.TickCount64, DresserObjectId = FindDresserObjectId() };
+        var free = scanner.CountFreeBagSlots();
+        foreach (var e in armory.Values)
+        {
+            if (state.ToMove.Count >= free) break;
+            state.ToMove.Enqueue(e);
+        }
+
+        state.Total = state.ToMove.Count;
+        var dropped = armory.Count - state.Total;
+        if (dropped > 0)
+            LastItemStatus = $"가방 빈칸이 {free}칸뿐이라 장비함 조각 {dropped}개는 이번에 넣지 않습니다.";
+
+        prestage = state;
+        CloseDresser();
+        Status = $"장비함 조각 {state.Total}개를 가방으로 옮기기 위해 환상의 옷장을 잠시 닫습니다…";
+        Debug("s2 prestage: {Count} armoury pieces to move (dropped {Dropped}), dresser object {Obj}", state.Total, dropped, state.DresserObjectId);
+    }
+
+    private void TickPrestage()
+    {
+        var st = prestage!;
+        var now = Environment.TickCount64;
+
+        switch (st.Phase)
+        {
+            case PrestagePhase.Closing:
+                if (IsAddonVisible("MiragePrismPrismBox"))
+                {
+                    if (now - st.PhaseAt > 2000)
+                    {
+                        if (++st.CloseAttempts > 3)
+                        {
+                            Stop("환상의 옷장을 닫지 못했습니다. 옷장을 직접 닫고 3번 탭으로 장비를 가방에 옮긴 뒤 다시 시도해 주세요.");
+                            return;
+                        }
+
+                        CloseDresser();
+                        st.PhaseAt = now;
+                    }
+                    return;
+                }
+
+                st.Phase = PrestagePhase.Moving;
+                st.PhaseAt = now;
+                Status = $"환상의 옷장을 닫았습니다. 장비함 조각 {st.Total}개를 가방으로 옮기는 중…";
+                return;
+
+            case PrestagePhase.Moving:
+            {
+                if (st.Current is { } cur)
+                {
+                    if (scanner.TryResolve(cur.Dest, cur.Entry.ItemId, out _))
+                    {
+                        st.Moved[cur.Entry.Key] = cur.Dest;
+                        Debug("s2 prestage moved {Name} {From} -> {To}", cur.Entry.Name, cur.Entry.Key.Id, cur.Dest.Id);
+                        st.Current = null;
+                        st.PhaseAt = now;
+                    }
+                    else if (now - cur.At > MoveTimeoutMs)
+                    {
+                        Skipped++;
+                        LastItemStatus = $"{cur.Entry.Name}: 가방으로 옮긴 결과를 확인하지 못해 건너뜁니다.";
+                        log.Warning("[KWC] s2 prestage move not confirmed {Name} {From} -> {To}", cur.Entry.Name, cur.Entry.Key.Id, cur.Dest.Id);
+                        st.Current = null;
+                        st.PhaseAt = now;
+                    }
+                    return;
+                }
+
+                if (now - st.PhaseAt < PrestageMoveIntervalMs)
+                    return;
+
+                if (st.ToMove.TryDequeue(out var next))
+                {
+                    var inventory = InventoryManager.Instance();
+                    if (inventory == null || !scanner.TryResolve(next.Key, next.ItemId, out _))
+                    {
+                        Skipped++;
+                        LastItemStatus = $"{next.Name}: 위치가 바뀌어 건너뜁니다.";
+                        return;
+                    }
+
+                    if (!scanner.TryFindFirstEmptyBag(out var dest))
+                    {
+                        Skipped++;
+                        LastItemStatus = $"{next.Name}: 가방 빈칸이 없어 건너뜁니다.";
+                        return;
+                    }
+
+                    var rc = inventory->MoveItemSlot(next.Key.Container, (ushort)next.Key.Slot, dest.Container, (ushort)dest.Slot, true);
+                    Debug("s2 prestage move {Name} {From} -> {To}: rc={Rc}", next.Name, next.Key.Id, dest.Id, rc);
+                    if (rc == 10)
+                    {
+                        Stop("게임이 아직 아이템 이동을 막고 있습니다(옷장이나 다른 창이 열려 있음). 창을 닫고 다시 시도해 주세요.");
+                        return;
+                    }
+
+                    if (rc != 0)
+                    {
+                        Failed++;
+                        LastItemStatus = $"{next.Name}: 가방으로 옮기지 못했습니다 ({rc}).";
+                        return;
+                    }
+
+                    st.Current = (next, dest, now);
+                    Status = $"가방으로 옮기는 중: {st.Moved.Count + 1}/{st.Total}";
+                    return;
+                }
+
+                RebuildQueuesAfterPrestage(st.Moved);
+                st.Phase = PrestagePhase.Reopen;
+                st.PhaseAt = now;
+                return;
+            }
+
+            case PrestagePhase.Reopen:
+                if (config.Stage2AutoReopenDresser && TryInteractDresser(st))
+                {
+                    st.ReopenRequested = true;
+                    st.ReopenAttempts++;
+                    Status = $"장비함 조각 {st.Moved.Count}개를 가방으로 옮겼습니다. 환상의 옷장을 다시 여는 중…";
+                }
+                else
+                {
+                    Status = $"장비함 조각 {st.Moved.Count}개를 가방으로 옮겼습니다. 환상의 옷장을 다시 열어 주세요 — 열리면 자동으로 이어서 저장합니다.";
+                }
+
+                st.Phase = PrestagePhase.WaitDresser;
+                st.PhaseAt = now;
+                return;
+
+            case PrestagePhase.WaitDresser:
+                if (IsDresserReady())
+                {
+                    Debug("s2 prestage done: dresser ready again, sets={Sets} singles={Singles}", setQueue.Count, singleQueue.Count);
+                    prestage = null;
+                    nextSetActionAt = now + 500;
+                    Status = $"환상의 옷장이 열렸습니다. 이어서 저장합니다 (세트 {setQueue.Count}개 · 단벌 {singleQueue.Count}개).";
+                    return;
+                }
+
+                if (st.ReopenRequested && now - st.PhaseAt > ReopenRetryMs)
+                {
+                    st.PhaseAt = now;
+                    if (config.Stage2AutoReopenDresser && st.ReopenAttempts < 2 && TryInteractDresser(st))
+                        st.ReopenAttempts++;
+                    else
+                        Status = "환상의 옷장이 열리지 않았습니다. 직접 열어 주세요 — 열리면 자동으로 이어서 저장합니다.";
+                }
+                return;
+        }
+    }
+
+    private void RebuildQueuesAfterPrestage(Dictionary<ItemLocationKey, ItemLocationKey> moved)
+    {
+        PhysicalGearEntry? Remap(PhysicalGearEntry e)
+        {
+            if (!IsArmory(e.Key.Container)) return e;
+            return moved.TryGetValue(e.Key, out var dest) ? e with { Key = dest } : null;
+        }
+
+        foreach (var b in plannedSets)
+        {
+            var pieces = new List<SetPiece>();
+            foreach (var p in b.Pieces)
+            {
+                var e = Remap(p.Entry);
+                if (e is null) { Skipped++; continue; }
+                pieces.Add(p with { Entry = e });
+            }
+
+            var min = b.ExistingIndex.HasValue ? 1 : 2;
+            if (pieces.Count >= min) setQueue.Enqueue(new SetBatch(b.Set, pieces, b.ExistingIndex));
+            else Skipped += pieces.Count;
+        }
+
+        foreach (var s in plannedSingles)
+        {
+            var e = Remap(s);
+            if (e is null) { Skipped++; continue; }
+            singleQueue.Enqueue(e);
+        }
+
+        plannedSets = [];
+        plannedSingles = [];
+    }
+
+    private void CloseDresser()
+    {
+        var addon = (AtkUnitBase*)gameGui.GetAddonByName("MiragePrismPrismBox").Address;
+        if (addon != null && addon->IsVisible)
+        {
+            Debug("s2 prestage: closing dresser window");
+            addon->Close(true);
+        }
+    }
+
+    private bool IsAddonVisible(string name)
+    {
+        var addon = (AtkUnitBase*)gameGui.GetAddonByName(name).Address;
+        return addon != null && addon->IsVisible;
+    }
+
+    /// Nearest glamour dresser object (EObj 2009439, or any event object named like "옷장") within reach.
+    private ulong FindDresserObjectId()
+    {
+        var player = objects.LocalPlayer;
+        if (player == null) return 0;
+
+        IGameObject? best = null;
+        var bestDist = float.MaxValue;
+        foreach (var obj in objects)
+        {
+            if (obj.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.EventObj) continue;
+            var isDresser = obj.BaseId == GlamourDresserEObj || obj.Name.TextValue.Contains("옷장", StringComparison.Ordinal);
+            if (!isDresser) continue;
+
+            var d = Vector3.Distance(obj.Position, player.Position);
+            if (d < bestDist) { bestDist = d; best = obj; }
+        }
+
+        if (best == null || bestDist > 12f)
+        {
+            Debug("s2 prestage: no dresser object nearby (best {Dist})", bestDist);
+            return 0;
+        }
+
+        Debug("s2 prestage: dresser object {Name} id={Id} dataId={DataId} dist={Dist:F1}", best.Name.TextValue, best.GameObjectId, best.BaseId, bestDist);
+        return best.GameObjectId;
+    }
+
+    private bool TryInteractDresser(PrestageState st)
+    {
+        if (st.DresserObjectId == 0) return false;
+        var obj = objects.SearchById(st.DresserObjectId);
+        if (obj == null) return false;
+
+        var target = TargetSystem.Instance();
+        if (target == null) return false;
+
+        var result = target->InteractWithObject((FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)obj.Address, false);
+        Debug("s2 prestage: interact with dresser {Id} -> {Result}", st.DresserObjectId, result);
+        return true;
     }
 
     // ---- staging: the dresser only takes items from the bags, so armoury pieces are moved first ----
@@ -590,7 +900,9 @@ public sealed unsafe class Stage2InventoryToDresser
             if (rc != 0)
             {
                 Failed++;
-                LastItemStatus = $"{next.Entry.Name}: 가방으로 옮기지 못했습니다 ({rc}).";
+                LastItemStatus = rc == 10
+                    ? $"{next.Entry.Name}: 옷장이 열린 상태라 게임이 이동을 막았습니다. 가방 빈칸을 늘리고 다시 시도해 주세요."
+                    : $"{next.Entry.Name}: 가방으로 옮기지 못했습니다 ({rc}).";
                 return;
             }
 
@@ -783,7 +1095,9 @@ public sealed unsafe class Stage2InventoryToDresser
                     if (rc != 0)
                     {
                         Failed++;
-                        LastItemStatus = $"{entry.Name}: 가방으로 옮기지 못했습니다 ({rc}).";
+                        LastItemStatus = rc == 10
+                            ? $"{entry.Name}: 옷장이 열린 상태라 게임이 이동을 막았습니다. 가방 빈칸을 늘리고 다시 시도해 주세요."
+                            : $"{entry.Name}: 가방으로 옮기지 못했습니다 ({rc}).";
                         FinishSingle();
                         return;
                     }

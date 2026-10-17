@@ -10,7 +10,8 @@ namespace KRWardrobeCleaner;
 
 public sealed class Plugin : IDalamudPlugin
 {
-    private const string VersionLabel = "v0.11.1";
+    private const string VersionLabel = "v0.11.2";
+    private static readonly string[] CommandNames = ["/kwc", "/가방"];
 
     private static readonly Vector4 ColorOk = new(0.60f, 0.90f, 0.60f, 1f);
     private static readonly Vector4 ColorBusy = new(1.00f, 0.85f, 0.45f, 1f);
@@ -35,6 +36,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IFramework Framework { get; private set; } = null!;
     [PluginService] internal static IGameGui GameGui { get; private set; } = null!;
     [PluginService] internal static IPluginLog Log { get; private set; } = null!;
+    [PluginService] internal static IObjectTable Objects { get; private set; } = null!;
 
     private readonly Configuration config;
     private readonly GlamourStateCache glamourCache;
@@ -63,14 +65,17 @@ public sealed class Plugin : IDalamudPlugin
         filter = new GearFilter(excel, config, dresserSnapshot);
         stage1 = new Stage1DresserToInventory(excel, glamourCache, GameGui, config, SaveConfig);
         duplicates = new DresserDuplicateCleaner(excel, outfits, GameGui, Log, config, SaveConfig);
-        stage2 = new Stage2InventoryToDresser(excel, scanner, outfits, filter, GameGui, Log, config, SaveConfig);
+        stage2 = new Stage2InventoryToDresser(excel, scanner, outfits, filter, GameGui, Objects, Log, config, SaveConfig);
         transfer = new GearTransfer(excel, scanner, filter, Log, config, SaveConfig);
         stage4 = new Stage4Discard(scanner, GameGui, config, SaveConfig);
 
-        Commands.AddHandler("/kwc", new CommandInfo((_, _) => windowOpen = !windowOpen)
+        foreach (var command in CommandNames)
         {
-            HelpMessage = "히메짱 옷장 정리기를 엽니다.",
-        });
+            Commands.AddHandler(command, new CommandInfo((_, _) => windowOpen = !windowOpen)
+            {
+                HelpMessage = "히메짱 옷장 정리기를 엽니다.",
+            });
+        }
 
         PluginInterface.UiBuilder.Draw += Draw;
         PluginInterface.UiBuilder.OpenMainUi += Open;
@@ -94,7 +99,8 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.Draw -= Draw;
         PluginInterface.UiBuilder.OpenMainUi -= Open;
         PluginInterface.UiBuilder.OpenConfigUi -= Open;
-        Commands.RemoveHandler("/kwc");
+        foreach (var command in CommandNames)
+            Commands.RemoveHandler(command);
     }
 
     private void Open() => windowOpen = true;
@@ -420,7 +426,7 @@ public sealed class Plugin : IDalamudPlugin
 
     private void DrawStage2()
     {
-        Help("장비함과 가방에서 환상의 옷장에 넣을 수 있는 장비를 찾아, 기존 의상 세트 보충 → 세트 우선 저장 → 단벌 저장 순으로 넣습니다. 환상의 옷장과 '아이템 맡기기' 목록을 연 상태에서 쓰세요. 내구도 100% 미만은 게임이 받지 않아 자동 제외합니다. 게임은 가방에 있는 장비만 맡길 수 있어서, 장비함 장비는 저장 직전에 가방으로 옮겼다가 맡깁니다(가방 빈칸 필요).");
+        Help("장비함과 가방에서 환상의 옷장에 넣을 수 있는 장비를 찾아, 기존 의상 세트 보충 → 세트 우선 저장 → 단벌 저장 순으로 넣습니다. 환상의 옷장과 '아이템 맡기기' 목록을 연 상태에서 쓰세요. 내구도 100% 미만은 게임이 받지 않아 자동 제외합니다. 게임은 가방에 있는 장비만 맡길 수 있고 옷장이 열린 동안은 장비함에서 꺼낼 수도 없어서, 장비함 장비가 있으면 옷장을 잠시 닫고 가방으로 옮긴 뒤 옷장을 다시 열어 이어서 넣습니다(가방 빈칸 필요).");
 
         var running = stage2.IsRunning;
         if (running) ImGui.BeginDisabled();
@@ -447,9 +453,19 @@ public sealed class Plugin : IDalamudPlugin
             stage2.UpdateIncludeMateria(materia);
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("게임이 거절하면 실패로 기록됩니다.");
+        ImGui.SameLine();
+        var reopen = config.Stage2AutoReopenDresser;
+        if (ImGui.Checkbox("옷장 자동 다시 열기##s2reopen", ref reopen)) { config.Stage2AutoReopenDresser = reopen; SaveConfig(); }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("장비함 조각이 있으면 옷장을 잠시 닫고 가방으로 옮긴 뒤, 근처의 환상의 옷장과 상호작용해 다시 엽니다. 끄면 옮긴 뒤 직접 열어 주세요(열리면 자동으로 이어서 저장).");
 
         if (PrimaryButton($"기존 세트에만 넣기 ({stage2.Selected.Count}개)##s2go1") && CanStart(stage2.IsRunning))
             stage2.StartExistingSetsOnly();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("옷장에 이미 있는 의상 세트의 빈 조각만 채웁니다.");
+        ImGui.SameLine();
+        if (PrimaryButton($"세트화 가능한 것만 넣기 ({stage2.Selected.Count}개)##s2go3") && CanStart(stage2.IsRunning))
+            stage2.StartSetsOnly();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("기존 세트 보충 + 조각이 2개 이상 모인 새 세트만 넣고, 단벌은 넣지 않습니다.");
         ImGui.SameLine();
         if (PrimaryButton($"세트 우선, 나머지는 단벌로 넣기 ({stage2.Selected.Count}개)##s2go2") && CanStart(stage2.IsRunning))
             stage2.StartSetsThenSingles();
