@@ -10,7 +10,7 @@ namespace KRWardrobeCleaner;
 
 public sealed partial class Plugin : IDalamudPlugin
 {
-    private const string VersionLabel = "v0.12.0";
+    private const string VersionLabel = "v0.12.1";
     private static readonly string[] CommandNames = ["/kwc", "/가방"];
 
     [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
@@ -22,8 +22,10 @@ public sealed partial class Plugin : IDalamudPlugin
     [PluginService] internal static IObjectTable Objects { get; private set; } = null!;
     [PluginService] internal static ICondition Condition { get; private set; } = null!;
     [PluginService] internal static IGameInteropProvider Interop { get; private set; } = null!;
+    [PluginService] internal static ITextureProvider Textures { get; private set; } = null!;
 
     private readonly Configuration config;
+    private readonly ExcelIndex excel;
     private readonly GlamourStateCache glamourCache;
     private readonly DresserSnapshot dresserSnapshot;
     private readonly GearFilter filter;
@@ -42,7 +44,7 @@ public sealed partial class Plugin : IDalamudPlugin
     public Plugin()
     {
         config = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
-        var excel = new ExcelIndex(Data);
+        excel = new ExcelIndex(Data);
         var scanner = new InventoryScanner(excel);
         var outfits = new OutfitCatalog(Data, excel);
 

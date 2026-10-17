@@ -54,6 +54,7 @@ public sealed class ExcelIndex
     private Dictionary<uint, uint>? itemEquipSlotCategory;
     private Dictionary<uint, InventoryType>? equipSlotContainers;
     private List<JobInfo>? jobs;
+    private Dictionary<uint, uint>? icons;
 
     public ExcelIndex(IDataManager data) => this.data = data;
 
@@ -66,6 +67,9 @@ public sealed class ExcelIndex
     public IReadOnlyDictionary<uint, int> RequiredLevels => requiredLevels ??= BuildRequiredLevels();
     public IReadOnlySet<uint> OutfitSetIds => outfitSetIds ??= BuildOutfitSetIds();
     public IReadOnlyList<JobInfo> Jobs => jobs ??= BuildJobs();
+
+    public IReadOnlyDictionary<uint, uint> Icons => icons ??= BuildItemIcons();
+    public uint IconOf(uint itemId) => Icons.TryGetValue(itemId, out var icon) ? icon : 0;
 
     public string NameOf(uint id)
         => Names.TryGetValue(id, out var name) && !string.IsNullOrWhiteSpace(name) ? name : $"아이템 #{id}";
@@ -128,6 +132,21 @@ public sealed class ExcelIndex
             var id = ReadRowId(row);
             if (id == 0) continue;
             result[id] = row.GetType().GetProperty("Name")?.GetValue(row)?.ToString() ?? string.Empty;
+        }
+        return result;
+    }
+
+    private Dictionary<uint, uint> BuildItemIcons()
+    {
+        var result = new Dictionary<uint, uint>();
+        foreach (var row in GetSheet("Item"))
+        {
+            if (row is null) continue;
+            var id = ReadRowId(row);
+            if (id == 0) continue;
+            var icon = row.GetType().GetProperty("Icon")?.GetValue(row);
+            if (icon is null) continue;
+            try { result[id] = Convert.ToUInt32(icon); } catch { }
         }
         return result;
     }

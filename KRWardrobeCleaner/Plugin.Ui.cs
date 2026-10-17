@@ -1,6 +1,7 @@
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
+using Dalamud.Interface.Textures;
 using FFXIVClientStructs.FFXIV.Client.Game;
 
 namespace KRWardrobeCleaner;
@@ -185,6 +186,24 @@ public sealed partial class Plugin
         ImGui.PopStyleColor(3);
     }
 
+    /// Draws the item's game icon (frame-height square) and leaves the cursor on the same line for the name.
+    private void ItemIcon(uint itemId)
+    {
+        var size = ImGui.GetFrameHeight();
+        var iconId = excel.IconOf(itemId);
+        if (iconId != 0)
+        {
+            var wrap = Textures.GetFromGameIcon(new GameIconLookup(iconId)).GetWrapOrEmpty();
+            ImGui.Image(wrap.Handle, new Vector2(size, size));
+        }
+        else
+        {
+            ImGui.Dummy(new Vector2(size, size));
+        }
+        ImGui.SameLine(0, 6);
+        ImGui.AlignTextToFramePadding();
+    }
+
     private static string Where(InventoryType type)
         => type switch
         {
@@ -265,7 +284,7 @@ public sealed partial class Plugin
             if (ImGui.Checkbox($"##s1-{entry.DresserSlot}", ref selected))
                 stage1.SetSelected(entry.DresserSlot, selected);
             ImGui.TableNextColumn();
-            ImGui.AlignTextToFramePadding();
+            ItemIcon(entry.ItemId);
             ImGui.TextUnformatted(entry.Name);
             ImGui.TableNextColumn();
             UiKit.Chips((entry.IsDyed, "염색됨", UiKit.Tag), (entry.UsedOnPlate, "투영세트 등록중", UiKit.Busy));
@@ -316,7 +335,7 @@ public sealed partial class Plugin
             if (ImGui.Checkbox($"##dup-{entry.DresserSlot}", ref selected))
                 duplicates.SetSelected(entry.DresserSlot, selected);
             ImGui.TableNextColumn();
-            ImGui.AlignTextToFramePadding();
+            ItemIcon(entry.ItemId);
             ImGui.TextUnformatted(entry.Name);
             ImGui.TableNextColumn();
             if (entry.IsKeep) UiKit.Chip("남길 것", UiKit.Ok);
@@ -421,7 +440,7 @@ public sealed partial class Plugin
             if (reason == null && ImGui.Checkbox($"##s2-{entry.Key.Id}", ref selected))
                 stage2.SetSelected(entry.Key, selected);
             ImGui.TableNextColumn();
-            ImGui.AlignTextToFramePadding();
+            ItemIcon(entry.ItemId);
             if (reason != null) ImGui.TextDisabled(entry.Name);
             else if (stage2.IsMatched(entry.Key)) ImGui.TextColored(UiKit.Ok, entry.Name);
             else ImGui.TextUnformatted(entry.Name);
@@ -515,7 +534,7 @@ public sealed partial class Plugin
             if (!excluded && ImGui.Checkbox($"##tr-{gear.Key.Id}", ref selected))
                 transfer.SetSelected(gear.Key, selected);
             ImGui.TableNextColumn();
-            ImGui.AlignTextToFramePadding();
+            ItemIcon(gear.ItemId);
             if (excluded) ImGui.TextDisabled(gear.Name);
             else if (entry.Matched) ImGui.TextColored(UiKit.Ok, gear.Name);
             else ImGui.TextUnformatted(gear.Name);
@@ -723,7 +742,7 @@ public sealed partial class Plugin
             if (ImGui.Checkbox($"##s4-{entry.Key.Id}", ref selected))
                 stage4.SetSelected(entry.Key, selected);
             ImGui.TableNextColumn();
-            ImGui.AlignTextToFramePadding();
+            ItemIcon(entry.ItemId);
             ImGui.TextUnformatted(entry.Name);
             ImGui.TableNextColumn();
             ImGui.AlignTextToFramePadding();
