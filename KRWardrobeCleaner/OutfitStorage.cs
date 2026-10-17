@@ -108,6 +108,7 @@ public sealed unsafe class Stage2InventoryToDresser
     private const int MoveTimeoutMs = 3000;        // armoury -> bag move confirmation
     private const int ListWaitMs = 2500;           // wait for the game deposit list to show a bag item
     private const int ListRefreshAfterMs = 800;    // ask the game to rebuild the list after this long
+    private const int DresserGraceMs = 2000;        // how long the dresser may look 'not ready' (dialog, relayout) before we stop
 
     private readonly ExcelIndex excel;
     private readonly InventoryScanner scanner;
@@ -137,6 +138,7 @@ public sealed unsafe class Stage2InventoryToDresser
     private long listWaitStart;
     private bool listRefreshRequested;
     private long confirmStartedAt;
+    private long notReadySince;
     private string? lastPromptLogged;
 
     private PrestageState? prestage;
@@ -485,11 +487,30 @@ public sealed unsafe class Stage2InventoryToDresser
             return;
         }
 
+        var tickNow = Environment.TickCount64;
         if (!IsDresserReady())
         {
+            if (notReadySince == 0)
+            {
+                notReadySince = tickNow;
+                LogDresserState("dresser not ready");
+            }
+
+            // A deposit confirmation may be up: keep driving the single-item flow.
+            if (pendingSingle is not null && singleState is SingleStoreState.Confirm or SingleStoreState.Wait)
+            {
+                TickSingle();
+                return;
+            }
+
+            if (tickNow - notReadySince < DresserGraceMs)
+                return;
+
+            LogDresserState("stopping");
             Stop("환상의 옷장 또는 아이템 맡기기 목록이 닫혀 작업을 중지했습니다.");
             return;
         }
+        notReadySince = 0;
 
         if (pendingBatch is not null)
         {
@@ -859,6 +880,20 @@ public sealed unsafe class Stage2InventoryToDresser
             Debug("s2 prestage: closing dresser window");
             addon->Close(true);
         }
+    }
+
+    private void LogDresserState(string why)
+    {
+        var mm = MirageManager.Instance();
+        var box = (AtkUnitBase*)gameGui.GetAddonByName("MiragePrismPrismBox").Address;
+        var list = (AtkUnitBase*)gameGui.GetAddonByName("MiragePrismPrismBoxCrystallize").Address;
+        var yesno = (AddonSelectYesno*)gameGui.GetAddonByName("SelectYesno").Address;
+        var prompt = yesno != null && yesno->AtkUnitBase.IsVisible && yesno->PromptText != null ? yesno->PromptText->NodeText.ToString().Replace("\n", " ") : "-";
+        Debug("s2 state ({Why}): prismBoxLoaded={Loaded} dresserWindow={BoxVis}/{BoxReady} depositList={ListVis}/{ListReady} yesno=\"{Prompt}\" single={State}",
+            why, mm != null && mm->PrismBoxLoaded,
+            box != null && box->IsVisible, box != null && box->IsReady,
+            list != null && list->IsVisible, list != null && list->IsReady,
+            prompt, singleState);
     }
 
     private bool IsAddonVisible(string name)

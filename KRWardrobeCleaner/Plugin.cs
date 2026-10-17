@@ -10,7 +10,7 @@ namespace KRWardrobeCleaner;
 
 public sealed class Plugin : IDalamudPlugin
 {
-    private const string VersionLabel = "v0.11.4";
+    private const string VersionLabel = "v0.11.5";
     private static readonly string[] CommandNames = ["/kwc", "/가방"];
 
     private static readonly Vector4 ColorOk = new(0.60f, 0.90f, 0.60f, 1f);
@@ -38,6 +38,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static IPluginLog Log { get; private set; } = null!;
     [PluginService] internal static IObjectTable Objects { get; private set; } = null!;
     [PluginService] internal static ICondition Condition { get; private set; } = null!;
+    [PluginService] internal static IGameInteropProvider Interop { get; private set; } = null!;
 
     private readonly Configuration config;
     private readonly GlamourStateCache glamourCache;
@@ -48,6 +49,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly Stage2InventoryToDresser stage2;
     private readonly GearTransfer transfer;
     private readonly Stage4Discard stage4;
+    private readonly CallbackRecorder recorder;
 
     private bool windowOpen = true;
     private bool filterPanelOpen = true;
@@ -69,6 +71,7 @@ public sealed class Plugin : IDalamudPlugin
         stage2 = new Stage2InventoryToDresser(excel, scanner, outfits, filter, GameGui, Objects, Condition, Log, config, SaveConfig);
         transfer = new GearTransfer(excel, scanner, filter, Log, config, SaveConfig);
         stage4 = new Stage4Discard(scanner, GameGui, config, SaveConfig);
+        recorder = new CallbackRecorder(Interop, Log);
 
         foreach (var command in CommandNames)
         {
@@ -102,6 +105,7 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.OpenConfigUi -= Open;
         foreach (var command in CommandNames)
             Commands.RemoveHandler(command);
+        recorder.Dispose();
     }
 
     private void Open() => windowOpen = true;
@@ -187,6 +191,14 @@ public sealed class Plugin : IDalamudPlugin
         }
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("/xllog 에 [KWC] 접두어로 후보 판정·요청·검증 결과를 남깁니다.");
+        ImGui.SameLine();
+        var rec = recorder.Enabled;
+        if (ImGui.Checkbox("콜백 기록##rec", ref rec))
+            recorder.Enabled = rec && recorder.HookOk;
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(recorder.HookOk
+                ? "켜 둔 채로 환상의 옷장을 손으로 조작하면(아이템 맡기기 목록에서 아이템 클릭 → 확인) 게임이 보내는 콜백 값이 /xllog 에 [KWC] callback 으로 남습니다."
+                : "이 게임 버전에서는 기록기를 걸 수 없습니다.");
 
         ImGui.SameLine();
         ImGui.TextColored(ColorMuted, "|");
