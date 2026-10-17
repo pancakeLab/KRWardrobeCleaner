@@ -73,12 +73,17 @@ internal static unsafe class YesNoPrompt
         => prompt.Replace("\r", string.Empty).Replace("\n", " ");
 
     /// Presses "Yes" the way the game's own button does (int 0, close=true).
-    public static bool Yes(AddonSelectYesno* yesno)
+    public static bool Yes(AddonSelectYesno* yesno) => Answer(yesno, 0);
+
+    /// Presses "No" (int 1, close=true; recorded from a manual cancel).
+    public static bool No(AddonSelectYesno* yesno) => Answer(yesno, 1);
+
+    private static bool Answer(AddonSelectYesno* yesno, int value)
     {
         if (yesno == null || !yesno->AtkUnitBase.IsVisible) return false;
-        var value = new AtkValue();
-        value.SetInt(0);
-        yesno->AtkUnitBase.FireCallback(1, &value, true);
+        var atk = new AtkValue();
+        atk.SetInt(value);
+        yesno->AtkUnitBase.FireCallback(1, &atk, true);
         return true;
     }
 }

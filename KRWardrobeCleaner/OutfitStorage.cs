@@ -104,13 +104,14 @@ public sealed unsafe class Stage2InventoryToDresser
     private const ushort FullCondition = 30000;
     private const int MaxBatchPieces = 9;          // pieces per store request (same cap as other implementations)
     private const int BatchVerifyTimeoutMs = 6000; // how long we wait for the game to actually take the pieces
-    private const int SingleTimeoutMs = 15000;     // whole single-item flow (staging + deposit + confirm)
+    private const int SingleTimeoutMs = 6000;      // whole single-item flow (staging + deposit + confirm); a stored item vanishes within ~0.3 s
+    private const int AfterStoreGapMs = 250;       // let the game rebuild its deposit list before the next request
     private const int MoveTimeoutMs = 3000;        // armoury -> bag move confirmation
-    private const int ListWaitMs = 2500;           // wait for the game deposit list to show a bag item
-    private const int ListRefreshAfterMs = 800;    // ask the game to rebuild the list after this long
+    private const int ListWaitMs = 1500;           // wait for the game deposit list to show a bag item
+    private const int ListRefreshAfterMs = 150;    // ask the game to rebuild the list after this long
     private const int DresserGraceMs = 2000;        // how long the dresser may look 'not ready' (dialog, relayout) before we stop
     private const int CrystallizeActionPendingOffset = 0x11AE7D; // MiragePrismPrismBoxData: when set, the agent opens the deposit confirm for CrystallizeItemIndex
-    private const int ConfirmAppearMs = 6000;        // how long we wait for the deposit confirm dialog before giving up on the item
+    private const int ConfirmAppearMs = 3000;        // how long we wait for the deposit confirm dialog before giving up on the item
     private const int ConfirmByTimingMs = 250;       // a dialog that opens this long after our request is ours even if its text is unreadable
     private const int ConfirmMissLimit = 3;          // consecutive unanswered dialogs before the run stops
     private const uint DepositRowCallback = 14;      // recorded from a manual deposit: Crystallize [uint 14, uint row, uint 0], close=true
@@ -147,6 +148,8 @@ public sealed unsafe class Stage2InventoryToDresser
     private int singleConfirmMisses;
     private bool yesNoOpenAtRequest;
     private long staleYesNoSince;
+    private long nextSingleAt;
+    private readonly HashSet<ItemLocationKey> singleRetried = [];
     private string? lastPromptLogged;
 
     private PrestageState? prestage;
@@ -464,6 +467,8 @@ public sealed unsafe class Stage2InventoryToDresser
         singleConfirmMisses = 0;
         staleYesNoSince = 0;
         yesNoOpenAtRequest = false;
+        nextSingleAt = 0;
+        singleRetried.Clear();
         Total = setQueue.Sum(b => b.Pieces.Count) + singleQueue.Count + skippedBlocked;
         LastItemStatus = skippedBlocked > 0 ? $"조건 미달(수리/마테리아) {skippedBlocked}개는 제외했습니다." : null;
         IsRunning = true;
@@ -1207,6 +1212,7 @@ public sealed unsafe class Stage2InventoryToDresser
         {
             Stored++;
             singleConfirmMisses = 0;
+            nextSingleAt = now + AfterStoreGapMs;
             LastItemStatus = $"{entry.Name}: 인벤토리에서 사라져 저장 완료로 확인했습니다.";
             Debug("s2 single stored {Name} {Loc}", entry.Name, entry.Key.Id);
             FinishSingle();
@@ -1271,6 +1277,31 @@ public sealed unsafe class Stage2InventoryToDresser
                 if (data == null)
                 {
                     Stop("환상의 옷장 맡기기 데이터를 읽을 수 없습니다.");
+                    return;
+                }
+
+                if (now < nextSingleAt)
+                    return;
+
+                // Right after a deposit the game's list still holds the stored item while the rows shift; a row taken
+                // from that stale list stores a DIFFERENT item than requested (seen in game: the confirm dialog names
+                // no item). Refuse to fire until every row points at a real item.
+                var staleRow = FindStaleListRow(data);
+                if (staleRow >= 0)
+                {
+                    if (!listRefreshRequested)
+                    {
+                        listRefreshRequested = true;
+                        agent->PopulateCrystallizeAndFireRefresh();
+                        Debug("s2 single {Name} {Loc}: deposit list stale at row {Row} (count={Count}), refresh requested", entry.Name, entry.Key.Id, staleRow, data->CrystallizeItemCount);
+                    }
+                    if (now - listWaitStart < ListWaitMs)
+                        return;
+
+                    Failed++;
+                    LastItemStatus = $"{entry.Name}: 게임의 맡기기 목록이 갱신되지 않아 건너뜁니다.";
+                    log.Warning("[KWC] s2 single {Name} {Loc}: deposit list still stale after {Ms}ms", entry.Name, entry.Key.Id, ListWaitMs);
+                    FinishSingle();
                     return;
                 }
 
@@ -1339,8 +1370,32 @@ public sealed unsafe class Stage2InventoryToDresser
                 return;
 
             case SingleStoreState.Confirm:
-                if (TryConfirmYesNoForItem(entry.Name, now - confirmStartedAt))
+            {
+                var prompt = FindDepositPrompt(entry.Name, now - confirmStartedAt);
+                if (prompt != null)
                 {
+                    if (TryReadSelectedCrystallizeItem(out var selKey, out var selId) && selId != 0 &&
+                        (selKey != entry.Key || selId != entry.ItemId))
+                    {
+                        // The game is about to store a different item than the one we asked for: decline.
+                        YesNoPrompt.No(prompt);
+                        log.Warning("[KWC] s2 single {Name} {Loc}: game selected a different item (#{SelId} at {SelLoc}); declined", entry.Name, entry.Key.Id, selId, selKey.Id);
+                        if (singleRetried.Add(entry.Key))
+                        {
+                            singleQueue.Enqueue(entry);
+                            LastItemStatus = $"{entry.Name}: 게임이 다른 아이템을 고르려 해 취소하고 나중에 다시 시도합니다.";
+                        }
+                        else
+                        {
+                            Failed++;
+                            LastItemStatus = $"{entry.Name}: 게임이 계속 다른 아이템을 골라 건너뜁니다.";
+                        }
+                        nextSingleAt = now + AfterStoreGapMs;
+                        FinishSingle();
+                        return;
+                    }
+
+                    YesNoPrompt.Yes(prompt);
                     singleConfirmMisses = 0;
                     singleState = SingleStoreState.Wait;
                     return;
@@ -1357,6 +1412,7 @@ public sealed unsafe class Stage2InventoryToDresser
                         Stop("단벌 맡기기 확인 창을 연속으로 처리하지 못해 멈췄습니다. 상단의 '디버그 로그'를 켠 채 다시 실행한 뒤 /xllog 의 [KWC] s2 yes/no 줄을 알려 주세요.");
                 }
                 return;
+            }
 
             case SingleStoreState.Wait:
                 return;
@@ -1426,6 +1482,42 @@ public sealed unsafe class Stage2InventoryToDresser
             else atk[i].SetInt(values[i].Value);
         }
         addon->FireCallback((uint)values.Count, atk, close);
+        return true;
+    }
+
+    /// Index of the first game-list row that no longer points at a real item (-1 when the list is consistent).
+    private int FindStaleListRow(MiragePrismPrismBoxData* data)
+    {
+        for (var i = 0; i < data->CrystallizeItemCount; i++)
+        {
+            var c = data->CrystallizeItems[i];
+            if (!scanner.TryResolve(new ItemLocationKey(c.Inventory, c.Slot), Normalize(c.ItemId), out _))
+                return i;
+        }
+        return -1;
+    }
+
+    /// The item the game selected for the pending deposit. Guarded: if the client structs of this game build do
+    /// not expose the field, the guard is skipped instead of crashing.
+    private static bool TryReadSelectedCrystallizeItem(out ItemLocationKey key, out uint itemId)
+    {
+        key = default;
+        itemId = 0;
+        try { return ReadSelectedCrystallizeItem(out key, out itemId); }
+        catch { return false; }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static bool ReadSelectedCrystallizeItem(out ItemLocationKey key, out uint itemId)
+    {
+        key = default;
+        itemId = 0;
+        var agent = AgentMiragePrismPrismBox.Instance();
+        var data = agent == null ? null : agent->Data;
+        if (data == null) return false;
+        var sel = data->CrystallizeSelectedItem;
+        key = new ItemLocationKey(sel.Inventory, sel.Slot);
+        itemId = Normalize(sel.ItemId);
         return true;
     }
 
@@ -1584,11 +1676,11 @@ public sealed unsafe class Stage2InventoryToDresser
     /// Confirms the deposit prompt. Matches by item name or dresser wording; a dialog that was not open when
     /// we sent the request and appears shortly after is accepted on timing alone (the KR client's prompt text
     /// could not be read through the PromptText node, so wording is not required). Every decision is logged.
-    private bool TryConfirmYesNoForItem(string expectedItemName, long elapsedMs)
+    private AddonSelectYesno* FindDepositPrompt(string expectedItemName, long elapsedMs)
     {
         var yesno = FindOpenYesNo();
         if (yesno == null)
-            return false;
+            return null;
 
         var prompt = YesNoPrompt.Read(yesno, out var source);
         var byName = !string.IsNullOrEmpty(prompt) && prompt.Contains(expectedItemName, StringComparison.OrdinalIgnoreCase);
@@ -1602,12 +1694,12 @@ public sealed unsafe class Stage2InventoryToDresser
                 log.Information("[KWC] s2 yes/no prompt not matched for {Name} ({Source}, open-at-request={Stale}, {Elapsed}ms): \"{Prompt}\"",
                     expectedItemName, source, yesNoOpenAtRequest, elapsedMs, YesNoPrompt.Flatten(prompt));
             }
-            return false;
+            return null;
         }
 
         var how = byName ? "name" : byKeyword ? "keyword" : "timing";
         log.Information("[KWC] s2 confirm {Name} via {How} ({Source}, {Elapsed}ms): \"{Prompt}\"", expectedItemName, how, source, elapsedMs, YesNoPrompt.Flatten(prompt));
-        return YesNoPrompt.Yes(yesno);
+        return yesno;
     }
 
 
