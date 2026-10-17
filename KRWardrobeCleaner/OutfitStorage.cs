@@ -100,6 +100,10 @@ public sealed unsafe class Stage2InventoryToDresser
     private const ushort FullCondition = 30000;
     private const int MaxBatchPieces = 9;          // pieces per store request (same cap as other implementations)
     private const int BatchVerifyTimeoutMs = 6000; // how long we wait for the game to actually take the pieces
+    private const int SingleTimeoutMs = 15000;     // whole single-item flow (staging + deposit + confirm)
+    private const int MoveTimeoutMs = 3000;        // armoury -> bag move confirmation
+    private const int ListWaitMs = 2500;           // wait for the game deposit list to show a bag item
+    private const int ListRefreshAfterMs = 800;    // ask the game to rebuild the list after this long
 
     private readonly ExcelIndex excel;
     private readonly InventoryScanner scanner;
@@ -122,6 +126,17 @@ public sealed unsafe class Stage2InventoryToDresser
     private long pendingSingleAt;
     private long nextSetActionAt;
     private SingleStoreState singleState;
+    private ItemLocationKey singleMoveDest;
+    private long singleMoveAt;
+    private long listWaitStart;
+    private bool listRefreshRequested;
+    private long confirmStartedAt;
+    private string? lastPromptLogged;
+
+    private SetBatch? stagingBatch;
+    private List<SetPiece> stagedPieces = [];
+    private readonly Queue<SetPiece> stagingToMove = new();
+    private (SetPiece Piece, ItemLocationKey Dest, long At)? stagingMove;
 
     public IReadOnlyList<PhysicalGearEntry> Entries => entries;
     public IReadOnlySet<ItemLocationKey> Selected => selected;
@@ -430,6 +445,9 @@ public sealed unsafe class Stage2InventoryToDresser
     {
         IsRunning = false;
         pendingBatch = null;
+        stagingBatch = null;
+        stagingMove = null;
+        stagingToMove.Clear();
         pendingSingle = null;
         singleState = SingleStoreState.None;
         Status = reason;
@@ -450,6 +468,12 @@ public sealed unsafe class Stage2InventoryToDresser
             return;
         }
 
+        if (stagingBatch is not null)
+        {
+            TickStaging();
+            return;
+        }
+
         if (pendingSingle is not null)
         {
             TickSingle();
@@ -461,7 +485,7 @@ public sealed unsafe class Stage2InventoryToDresser
 
         if (setQueue.TryDequeue(out var batch))
         {
-            StoreSetBatch(batch);
+            BeginStaging(batch);
             return;
         }
 
@@ -469,6 +493,8 @@ public sealed unsafe class Stage2InventoryToDresser
         {
             pendingSingle = single;
             pendingSingleAt = Environment.TickCount64;
+            listWaitStart = pendingSingleAt;
+            listRefreshRequested = false;
             singleState = SingleStoreState.Select;
             TickSingle();
             return;
@@ -478,6 +504,103 @@ public sealed unsafe class Stage2InventoryToDresser
         var completed = $"완료: 저장 {Stored} · 제외 {Skipped} · 실패 {Failed}";
         Scan();
         Status = completed;
+    }
+
+    // ---- staging: the dresser only takes items from the bags, so armoury pieces are moved first ----
+
+    private void BeginStaging(SetBatch batch)
+    {
+        stagingBatch = batch;
+        stagedPieces = [];
+        stagingToMove.Clear();
+        stagingMove = null;
+
+        var free = scanner.CountFreeBagSlots();
+        foreach (var piece in batch.Pieces)
+        {
+            if (!IsArmory(piece.Entry.Key.Container))
+            {
+                stagedPieces.Add(piece);
+                continue;
+            }
+
+            if (free <= 0)
+            {
+                Skipped++;
+                LastItemStatus = $"{piece.Entry.Name}: 장비함에서 가방으로 옮길 빈칸이 없어 건너뜁니다.";
+                Debug("s2 staging '{Set}' drop {Name} {Loc}: no free bag slot", batch.Set.Name, piece.Entry.Name, piece.Entry.Key.Id);
+                continue;
+            }
+
+            free--;
+            stagingToMove.Enqueue(piece);
+        }
+
+        if (stagingToMove.Count > 0)
+            LastItemStatus = $"{batch.Set.Name}: 장비함 조각 {stagingToMove.Count}개를 가방으로 옮기는 중…";
+        TickStaging();
+    }
+
+    private void TickStaging()
+    {
+        var batch = stagingBatch!;
+        var now = Environment.TickCount64;
+
+        if (stagingMove is { } move)
+        {
+            if (scanner.TryResolve(move.Dest, move.Piece.Entry.ItemId, out _))
+            {
+                stagedPieces.Add(move.Piece with { Entry = move.Piece.Entry with { Key = move.Dest } });
+                Debug("s2 staging '{Set}' moved {Name} {From} -> {To}", batch.Set.Name, move.Piece.Entry.Name, move.Piece.Entry.Key.Id, move.Dest.Id);
+                stagingMove = null;
+                nextSetActionAt = now + 250;
+            }
+            else if (now - move.At > MoveTimeoutMs)
+            {
+                Skipped++;
+                LastItemStatus = $"{move.Piece.Entry.Name}: 가방으로 옮긴 결과를 확인하지 못해 건너뜁니다.";
+                log.Warning("[KWC] s2 staging move not confirmed {Name} {From} -> {To}", move.Piece.Entry.Name, move.Piece.Entry.Key.Id, move.Dest.Id);
+                stagingMove = null;
+            }
+            return;
+        }
+
+        if (now < nextSetActionAt)
+            return;
+
+        if (stagingToMove.TryDequeue(out var next))
+        {
+            var inventory = InventoryManager.Instance();
+            if (inventory == null || !scanner.TryResolve(next.Entry.Key, next.Entry.ItemId, out _))
+            {
+                Skipped++;
+                LastItemStatus = $"{next.Entry.Name}: 위치가 바뀌어 건너뜁니다.";
+                return;
+            }
+
+            if (!scanner.TryFindFirstEmptyBag(out var dest))
+            {
+                Skipped++;
+                LastItemStatus = $"{next.Entry.Name}: 가방 빈칸이 없어 건너뜁니다.";
+                return;
+            }
+
+            var rc = inventory->MoveItemSlot(next.Entry.Key.Container, (ushort)next.Entry.Key.Slot, dest.Container, (ushort)dest.Slot, true);
+            Debug("s2 staging '{Set}' move {Name} {From} -> {To}: rc={Rc}", batch.Set.Name, next.Entry.Name, next.Entry.Key.Id, dest.Id, rc);
+            if (rc != 0)
+            {
+                Failed++;
+                LastItemStatus = $"{next.Entry.Name}: 가방으로 옮기지 못했습니다 ({rc}).";
+                return;
+            }
+
+            stagingMove = (next, dest, now);
+            return;
+        }
+
+        // Everything that could be staged is in the bags now.
+        stagingBatch = null;
+        StoreSetBatch(new SetBatch(batch.Set, stagedPieces, batch.ExistingIndex));
     }
 
     private void StoreSetBatch(SetBatch batch)
@@ -611,23 +734,22 @@ public sealed unsafe class Stage2InventoryToDresser
         var entry = pendingSingle!;
         var now = Environment.TickCount64;
 
-        if (!scanner.TryResolve(entry.Key, entry.ItemId, out _))
+        // Only after the deposit was requested does "gone from the bag" mean "stored".
+        if (singleState is SingleStoreState.Confirm or SingleStoreState.Wait && !scanner.TryResolve(entry.Key, entry.ItemId, out _))
         {
             Stored++;
             LastItemStatus = $"{entry.Name}: 인벤토리에서 사라져 저장 완료로 확인했습니다.";
             Debug("s2 single stored {Name} {Loc}", entry.Name, entry.Key.Id);
-            pendingSingle = null;
-            singleState = SingleStoreState.None;
+            FinishSingle();
             return;
         }
 
-        if (now - pendingSingleAt > 12000)
+        if (now - pendingSingleAt > SingleTimeoutMs)
         {
             Failed++;
             LastItemStatus = $"{entry.Name}: 단벌 저장 완료를 확인하지 못해 건너뜁니다.";
             log.Warning("[KWC] s2 single NOT stored {Name} #{Id} {Loc} state={State}", entry.Name, entry.ItemId, entry.Key.Id, singleState);
-            pendingSingle = null;
-            singleState = SingleStoreState.None;
+            FinishSingle();
             return;
         }
 
@@ -635,6 +757,44 @@ public sealed unsafe class Stage2InventoryToDresser
         {
             case SingleStoreState.Select:
             {
+                if (!scanner.TryResolve(entry.Key, entry.ItemId, out _))
+                {
+                    Skipped++;
+                    LastItemStatus = $"{entry.Name}: 위치가 바뀌어 건너뜁니다.";
+                    FinishSingle();
+                    return;
+                }
+
+                // The deposit list only contains bag items: move armoury gear to a bag first.
+                if (IsArmory(entry.Key.Container))
+                {
+                    var inventory = InventoryManager.Instance();
+                    if (inventory == null || !scanner.TryFindFirstEmptyBag(out var dest))
+                    {
+                        Skipped++;
+                        LastItemStatus = $"{entry.Name}: 장비함에서 가방으로 옮길 빈칸이 없어 건너뜁니다.";
+                        Debug("s2 single {Name} {Loc}: no free bag slot for staging", entry.Name, entry.Key.Id);
+                        FinishSingle();
+                        return;
+                    }
+
+                    var rc = inventory->MoveItemSlot(entry.Key.Container, (ushort)entry.Key.Slot, dest.Container, (ushort)dest.Slot, true);
+                    Debug("s2 single stage {Name} {From} -> {To}: rc={Rc}", entry.Name, entry.Key.Id, dest.Id, rc);
+                    if (rc != 0)
+                    {
+                        Failed++;
+                        LastItemStatus = $"{entry.Name}: 가방으로 옮기지 못했습니다 ({rc}).";
+                        FinishSingle();
+                        return;
+                    }
+
+                    singleMoveDest = dest;
+                    singleMoveAt = now;
+                    singleState = SingleStoreState.WaitMove;
+                    LastItemStatus = $"{entry.Name}: 장비함 → 가방으로 옮기는 중…";
+                    return;
+                }
+
                 var agent = AgentMiragePrismPrismBox.Instance();
                 var data = agent == null ? null : agent->Data;
                 if (data == null)
@@ -658,23 +818,53 @@ public sealed unsafe class Stage2InventoryToDresser
 
                 if (row < 0)
                 {
+                    // The game refreshes the list a little after the inventory changes; nudge it once, then give up.
+                    if (now - listWaitStart < ListWaitMs)
+                    {
+                        if (!listRefreshRequested && now - listWaitStart > ListRefreshAfterMs)
+                        {
+                            listRefreshRequested = true;
+                            agent->PopulateCrystallizeAndFireRefresh();
+                            Debug("s2 single {Name} {Loc}: requested deposit list refresh (count={Count})", entry.Name, entry.Key.Id, data->CrystallizeItemCount);
+                        }
+                        return;
+                    }
+
                     Skipped++;
                     LastItemStatus = $"{entry.Name}: 게임의 맡기기 목록에서 찾지 못해 건너뜁니다.";
                     Debug("s2 single {Name} {Loc} not in game deposit list (count={Count})", entry.Name, entry.Key.Id, data->CrystallizeItemCount);
-                    pendingSingle = null;
-                    singleState = SingleStoreState.None;
+                    FinishSingle();
                     return;
                 }
 
                 if (!FireCallback("MiragePrismPrismBoxCrystallize", 0, row))
                     return;
 
+                confirmStartedAt = now;
                 singleState = SingleStoreState.Confirm;
                 return;
             }
 
+            case SingleStoreState.WaitMove:
+                if (scanner.TryResolve(singleMoveDest, entry.ItemId, out _))
+                {
+                    pendingSingle = entry with { Key = singleMoveDest };
+                    listWaitStart = now;
+                    listRefreshRequested = false;
+                    singleState = SingleStoreState.Select;
+                    Debug("s2 single staged {Name} now at {Loc}", entry.Name, singleMoveDest.Id);
+                }
+                else if (now - singleMoveAt > MoveTimeoutMs)
+                {
+                    Failed++;
+                    LastItemStatus = $"{entry.Name}: 가방으로 옮긴 결과를 확인하지 못해 건너뜁니다.";
+                    log.Warning("[KWC] s2 single staging not confirmed {Name} {From} -> {To}", entry.Name, entry.Key.Id, singleMoveDest.Id);
+                    FinishSingle();
+                }
+                return;
+
             case SingleStoreState.Confirm:
-                if (TryConfirmYesNoForItem(entry.Name))
+                if (TryConfirmYesNoForItem(entry.Name, now - confirmStartedAt))
                     singleState = SingleStoreState.Wait;
                 return;
 
@@ -682,6 +872,14 @@ public sealed unsafe class Stage2InventoryToDresser
                 return;
         }
     }
+
+    private void FinishSingle()
+    {
+        pendingSingle = null;
+        singleState = SingleStoreState.None;
+    }
+
+    private static bool IsArmory(InventoryType type) => Array.IndexOf(InventoryScanner.ArmoryContainers, type) >= 0;
 
     private void RefreshBlockReasons()
     {
@@ -785,7 +983,9 @@ public sealed unsafe class Stage2InventoryToDresser
         return true;
     }
 
-    private bool TryConfirmYesNoForItem(string expectedItemName)
+    /// Confirms the deposit prompt. Prefers a prompt that names the item; after a short grace period a
+    /// deposit prompt ("맡기") that appeared for our request is accepted too. Unmatched prompts are logged.
+    private bool TryConfirmYesNoForItem(string expectedItemName, long elapsedMs)
     {
         for (var i = 1; i <= 4; i++)
         {
@@ -794,10 +994,22 @@ public sealed unsafe class Stage2InventoryToDresser
                 continue;
 
             var prompt = yesno->PromptText == null ? string.Empty : yesno->PromptText->NodeText.ToString();
-            if (string.IsNullOrWhiteSpace(prompt) ||
-                !prompt.Contains(expectedItemName, StringComparison.OrdinalIgnoreCase))
+            if (string.IsNullOrWhiteSpace(prompt))
                 continue;
 
+            var byName = prompt.Contains(expectedItemName, StringComparison.OrdinalIgnoreCase);
+            var byKeyword = elapsedMs > 600 && prompt.Contains("맡기", StringComparison.Ordinal);
+            if (!byName && !byKeyword)
+            {
+                if (lastPromptLogged != prompt)
+                {
+                    lastPromptLogged = prompt;
+                    Debug("s2 yes/no prompt not matched for {Name}: \"{Prompt}\"", expectedItemName, prompt.Replace("\n", " "));
+                }
+                continue;
+            }
+
+            Debug("s2 confirm {Name} via {How}: \"{Prompt}\"", expectedItemName, byName ? "name" : "keyword", prompt.Replace("\n", " "));
             yesno->AtkUnitBase.FireCallbackInt(0);
             return true;
         }
@@ -816,5 +1028,5 @@ public sealed unsafe class Stage2InventoryToDresser
     private sealed record SetPiece(PhysicalGearEntry Entry, int SetSlot);
     private sealed record SetBatch(OutfitCatalog.SetInfo Set, IReadOnlyList<SetPiece> Pieces, uint? ExistingIndex);
     private sealed record PendingBatch(OutfitCatalog.SetInfo Set, IReadOnlyList<SetPiece> Pieces, long SentAt);
-    private enum SingleStoreState { None, Select, Confirm, Wait }
+    private enum SingleStoreState { None, Select, WaitMove, Confirm, Wait }
 }

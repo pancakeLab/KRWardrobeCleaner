@@ -10,7 +10,7 @@ namespace KRWardrobeCleaner;
 
 public sealed class Plugin : IDalamudPlugin
 {
-    private const string VersionLabel = "v0.11.0";
+    private const string VersionLabel = "v0.11.1";
 
     private static readonly Vector4 ColorOk = new(0.60f, 0.90f, 0.60f, 1f);
     private static readonly Vector4 ColorBusy = new(1.00f, 0.85f, 0.45f, 1f);
@@ -420,7 +420,7 @@ public sealed class Plugin : IDalamudPlugin
 
     private void DrawStage2()
     {
-        Help("장비함과 가방에서 환상의 옷장에 넣을 수 있는 장비를 찾아, 기존 의상 세트 보충 → 세트 우선 저장 → 단벌 저장 순으로 넣습니다. 환상의 옷장과 '아이템 맡기기' 목록을 연 상태에서 쓰세요. 내구도 100% 미만은 게임이 받지 않아 자동 제외합니다.");
+        Help("장비함과 가방에서 환상의 옷장에 넣을 수 있는 장비를 찾아, 기존 의상 세트 보충 → 세트 우선 저장 → 단벌 저장 순으로 넣습니다. 환상의 옷장과 '아이템 맡기기' 목록을 연 상태에서 쓰세요. 내구도 100% 미만은 게임이 받지 않아 자동 제외합니다. 게임은 가방에 있는 장비만 맡길 수 있어서, 장비함 장비는 저장 직전에 가방으로 옮겼다가 맡깁니다(가방 빈칸 필요).");
 
         var running = stage2.IsRunning;
         if (running) ImGui.BeginDisabled();
@@ -596,7 +596,7 @@ public sealed class Plugin : IDalamudPlugin
         ImGui.Separator();
         var header = $"필터 (2·3번 탭 공유): {filter.Describe()}";
         ImGui.SetNextItemOpen(filterPanelOpen, ImGuiCond.Always);
-        var open = ImGui.TreeNodeEx($"{header}##filterpanel", ImGuiTreeNodeFlags.SpanAvailWidth | ImGuiTreeNodeFlags.Framed);
+        var open = ImGui.TreeNodeEx($"{header}###filterpanel", ImGuiTreeNodeFlags.SpanAvailWidth | ImGuiTreeNodeFlags.Framed);
         if (ImGui.IsItemToggledOpen()) filterPanelOpen = !filterPanelOpen;
         if (!open)
         {
@@ -611,7 +611,7 @@ public sealed class Plugin : IDalamudPlugin
         if (ImGui.Checkbox("직업##f1on", ref jobOn)) { config.FilterJobEnabled = jobOn; FilterChanged(); }
         ImGui.SameLine();
         var jobSummary = config.FilterJobs.Count == 0 ? "선택 없음" : string.Join(", ", config.FilterJobs.Select(filter.JobName));
-        if (ImGui.TreeNodeEx($"사용 가능한 장비: {jobSummary}##f1tree", ImGuiTreeNodeFlags.SpanAvailWidth))
+        if (ImGui.TreeNodeEx($"사용 가능한 장비: {jobSummary}###f1tree", ImGuiTreeNodeFlags.SpanAvailWidth))
         {
             if (ImGui.SmallButton("모두 해제##f1clear")) { config.FilterJobs.Clear(); FilterChanged(); }
             foreach (var (group, jobs) in JobGroups)
