@@ -111,6 +111,8 @@ public sealed unsafe class Stage2InventoryToDresser
 
     private readonly List<PhysicalGearEntry> entries = [];
     private readonly Dictionary<ItemLocationKey, string> blocked = [];
+    private readonly HashSet<ItemLocationKey> matched = [];
+    private readonly GearFilter filter;
     private readonly HashSet<ItemLocationKey> selected = [];
     private readonly Queue<SetBatch> setQueue = new();
     private readonly Queue<PhysicalGearEntry> singleQueue = new();
@@ -128,12 +130,17 @@ public sealed unsafe class Stage2InventoryToDresser
     public int Stored { get; private set; }
     public int Skipped { get; private set; }
     public int Failed { get; private set; }
+    public int Total { get; private set; }
+    public int Done => Stored + Skipped + Failed;
+    public bool IsMatched(ItemLocationKey key) => matched.Contains(key);
+    public int MatchedCount => matched.Count;
     public string Status { get; private set; } = "환상의 옷장을 연 뒤 후보를 검색해 주세요.";
     public string? LastItemStatus { get; private set; }
 
-    public Stage2InventoryToDresser(ExcelIndex excel, InventoryScanner scanner, OutfitCatalog outfits, IGameGui gameGui, IPluginLog log, Configuration config, System.Action saveConfig)
+    public Stage2InventoryToDresser(ExcelIndex excel, InventoryScanner scanner, OutfitCatalog outfits, GearFilter filter, IGameGui gameGui, IPluginLog log, Configuration config, System.Action saveConfig)
     {
         this.excel = excel;
+        this.filter = filter;
         this.scanner = scanner;
         this.outfits = outfits;
         this.gameGui = gameGui;
@@ -197,9 +204,46 @@ public sealed unsafe class Stage2InventoryToDresser
         if (config.DebugLog)
             LogExistingSets(manager);
 
-        Status = $"검색 완료: 환상의 옷장에 넣을 수 있는 장비 {entries.Count}개 (조건 미달 {blocked.Count}개, 이미 옷장에 있어 숨김 {hiddenStored}개).";
+        ApplyFilters();
+        Status = $"검색 완료: 넣을 수 있는 장비 {entries.Count}개 (조건 미달 {blocked.Count}개 · 이미 옷장에 있어 숨김 {hiddenStored}개)"
+               + (filter.AnyEnabled ? $" · 필터 일치 {matched.Count}개 중 {selected.Count}개 체크" : string.Empty) + ".";
         return entries.Count;
     }
+
+    /// Applies the shared gear filter: matching rows are checked (unless blocked) and sorted to the top.
+    public void ApplyFilters()
+    {
+        if (IsRunning) return;
+        matched.Clear();
+        if (!filter.AnyEnabled)
+        {
+            SortEntries();
+            return;
+        }
+
+        selected.Clear();
+        foreach (var entry in entries)
+        {
+            if (!filter.Matches(entry.ItemId, entry.RequiredLevel)) continue;
+            matched.Add(entry.Key);
+            if (!blocked.ContainsKey(entry.Key) && (config.Stage2IncludeDyed || !entry.IsDyed))
+                selected.Add(entry.Key);
+        }
+
+        SortEntries();
+        var warning = filter.DresserWarning is { } w ? " " + w : string.Empty;
+        Status = $"필터 일치 {matched.Count}개 중 {selected.Count}개 체크 (조건 미달·염색 제외).{warning}";
+    }
+
+    private void SortEntries()
+        => entries.Sort((a, b) =>
+        {
+            var ma = matched.Contains(a.Key);
+            var mb = matched.Contains(b.Key);
+            if (ma != mb) return ma ? -1 : 1;
+            var c = StringComparer.CurrentCulture.Compare(a.Name, b.Name);
+            return c != 0 ? c : a.Key.Id.CompareTo(b.Key.Id);
+        });
 
     public void SetSelected(ItemLocationKey key, bool value)
     {
@@ -375,6 +419,7 @@ public sealed unsafe class Stage2InventoryToDresser
 
         Stored = Failed = 0;
         Skipped = skippedBlocked;
+        Total = setQueue.Sum(b => b.Pieces.Count) + singleQueue.Count + skippedBlocked;
         LastItemStatus = skippedBlocked > 0 ? $"조건 미달(수리/마테리아) {skippedBlocked}개는 제외했습니다." : null;
         IsRunning = true;
         Status = $"저장 시작: 세트 작업 {setQueue.Count}개 · 단벌 {singleQueue.Count}개.";

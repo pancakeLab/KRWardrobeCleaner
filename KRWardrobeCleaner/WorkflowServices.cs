@@ -317,6 +317,8 @@ public sealed unsafe class Stage1DresserToInventory
     public int Restored { get; private set; }
     public int Skipped { get; private set; }
     public int Failed { get; private set; }
+    public int Total => queue.Count;
+    public int Done => index;
     public string Status { get; private set; } = "환상의 옷장을 연 뒤 검색해 주세요.";
     public string? LastItemStatus { get; private set; }
 
@@ -530,6 +532,8 @@ public sealed unsafe class Stage4Discard
     public int Discarded { get; private set; }
     public int Skipped { get; private set; }
     public int Failed { get; private set; }
+    public int Total { get; private set; }
+    public int Done => Discarded + Skipped + Failed;
     public string Status { get; private set; } = "파기 후보를 검색해 주세요.";
     public string? LastItemStatus { get; private set; }
 
@@ -708,6 +712,7 @@ public sealed unsafe class Stage4Discard
         foreach (var entry in chosen)
             queue.Enqueue(entry);
 
+        Total = queue.Count;
         Discarded = Skipped = Failed = 0;
         pending = null;
         nextAt = 0;

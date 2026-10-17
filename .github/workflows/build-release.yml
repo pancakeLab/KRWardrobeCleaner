@@ -1,13 +1,32 @@
 name: Build and Release
 
+# push / PR: build only (artifact). Releases are made by hand with "Run workflow":
+#   release = true, prerelease = true  -> Dalamud 테스트 채널용 prerelease
+#   release = true, prerelease = false -> 안정판
+# The Dalamud repo file (pluginmaster.json) lives in pancakeLab/Himechan_addon and is updated with
+# .github/himechan/wardrobe-release.ps1 there (use -SkipRelease after a release made here).
+
 on:
   push:
-    branches: [ main, v0.8.1-discard-integrity ]
+    branches: [ main ]
     paths:
       - "KRWardrobeCleaner/**"
-      - "repo.json"
       - ".github/workflows/build-release.yml"
+  pull_request:
   workflow_dispatch:
+    inputs:
+      release:
+        description: '릴리스 만들기 (vX.Y.Z.W 태그)'
+        type: boolean
+        default: false
+      prerelease:
+        description: '테스트 빌드(prerelease)로 표시'
+        type: boolean
+        default: true
+      notes:
+        description: '릴리스 노트 (선택)'
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -37,7 +56,7 @@ jobs:
         shell: pwsh
         run: dotnet build ".\KRWardrobeCleaner\KRWardrobeCleaner.csproj" --configuration Release
 
-      - name: Resolve package output
+      - name: Package
         id: package
         shell: pwsh
         run: |
@@ -49,26 +68,18 @@ jobs:
           $root = ".\KRWardrobeCleaner\bin\Release"
           $dll = Get-ChildItem $root -Recurse -File -Filter "KRWardrobeCleaner.dll" | Select-Object -First 1
           $manifest = Get-ChildItem $root -Recurse -File -Filter "KRWardrobeCleaner.json" | Select-Object -First 1
+          if ($null -eq $dll -or $null -eq $manifest) { throw "build output not found" }
 
-          if ($null -eq $dll) {
-            Get-ChildItem ".\KRWardrobeCleaner\bin" -Recurse | Select-Object FullName
-            throw "KRWardrobeCleaner.dll not found after successful build."
-          }
-          if ($null -eq $manifest) {
-            Get-ChildItem ".\KRWardrobeCleaner\bin" -Recurse | Select-Object FullName
-            throw "KRWardrobeCleaner.json not found after successful build."
-          }
+          $m = Get-Content $manifest.FullName -Raw | ConvertFrom-Json
+          if ($m.AssemblyVersion -ne $version) { throw "manifest AssemblyVersion $($m.AssemblyVersion) != csproj $version" }
 
           New-Item -ItemType Directory -Force -Path ".\package" | Out-Null
           Copy-Item $dll.FullName ".\package\KRWardrobeCleaner.dll" -Force
           Copy-Item $manifest.FullName ".\package\KRWardrobeCleaner.json" -Force
           Compress-Archive -Path ".\package\*" -DestinationPath ".\KRWardrobeCleaner.zip" -Force
 
-          $dllHash = (Get-FileHash ".\package\KRWardrobeCleaner.dll" -Algorithm SHA256).Hash
           $zipHash = (Get-FileHash ".\KRWardrobeCleaner.zip" -Algorithm SHA256).Hash
-          Set-Content ".\SHA256SUMS.txt" "KRWardrobeCleaner.dll  $dllHash`nKRWardrobeCleaner.zip  $zipHash"
-          Copy-Item ".\package\KRWardrobeCleaner.dll" ".\KRWardrobeCleaner.dll" -Force
-          "dll_sha256=$dllHash" >> $env:GITHUB_OUTPUT
+          Set-Content ".\SHA256SUMS.txt" "KRWardrobeCleaner.zip  $zipHash"
           "zip_sha256=$zipHash" >> $env:GITHUB_OUTPUT
 
       - name: Upload workflow artifact
@@ -76,36 +87,45 @@ jobs:
         with:
           name: KRWardrobeCleaner-${{ steps.package.outputs.version }}
           path: |
-            KRWardrobeCleaner.dll
             KRWardrobeCleaner.zip
             SHA256SUMS.txt
-            repo.json
           if-no-files-found: error
           retention-days: 14
 
       - name: Create or update GitHub Release
-        if: github.ref == 'refs/heads/main'
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.package.outputs.tag }}
           VERSION: ${{ steps.package.outputs.version }}
+          NOTES: ${{ inputs.notes }}
+          PRERELEASE: ${{ inputs.prerelease }}
         shell: pwsh
         run: |
-          gh release view $env:TAG *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $env:TAG ".\KRWardrobeCleaner.zip#Dalamud install package" ".\KRWardrobeCleaner.dll#Raw DLL" ".\SHA256SUMS.txt#SHA-256 checksums" --title "히메짱 옷장 정리기 $env:VERSION" --notes "v0.8.1은 4단계 자동 파기에 스마트 선택을 추가하고, Inventory4의 장비/비장비 모든 아이템을 일괄 파기하는 기능을 추가합니다. 전체 무결성 점검을 통해 의상 세트 저장 배열 패킹, 작업 완료 상태 보존, 인벤토리 함수 반환코드 판정, 투영세트 캐시 유지도 함께 수정했습니다."
+          $lines = @("히메짱 옷장 정리기 $env:VERSION")
+          if ($env:NOTES) { $lines += ""; $lines += $env:NOTES }
+          $lines += ""; $lines += "- KRWardrobeCleaner.zip SHA256: ${{ steps.package.outputs.zip_sha256 }}"
+          Set-Content ".\notes.md" ($lines -join "`n")
+
+          $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+          gh release view $env:TAG 2>&1 | Out-Null
+          $exists = ($LASTEXITCODE -eq 0)
+          $ErrorActionPreference = $prevEap
+
+          $title = "히메짱 옷장 정리기 $env:VERSION"
+          if ($env:PRERELEASE -eq 'true') { $title += " (테스트)" }
+          if (-not $exists) {
+            $extra = @()
+            if ($env:PRERELEASE -eq 'true') { $extra += "--prerelease"; $extra += "--latest=false" }
+            gh release create $env:TAG ".\KRWardrobeCleaner.zip#Dalamud install package" ".\SHA256SUMS.txt#SHA-256 checksums" --title $title --notes-file ".\notes.md" @extra
           } else {
-            gh release upload $env:TAG ".\KRWardrobeCleaner.zip#Dalamud install package" ".\KRWardrobeCleaner.dll#Raw DLL" ".\SHA256SUMS.txt#SHA-256 checksums" --clobber
+            gh release upload $env:TAG ".\KRWardrobeCleaner.zip#Dalamud install package" ".\SHA256SUMS.txt#SHA-256 checksums" --clobber
           }
+          if ($LASTEXITCODE -ne 0) { throw "gh release failed" }
 
       - name: Build summary
         shell: pwsh
         run: |
           Add-Content $env:GITHUB_STEP_SUMMARY "## 히메짱 옷장 정리기 ${{ steps.package.outputs.version }}"
-          Add-Content $env:GITHUB_STEP_SUMMARY "- DLL SHA-256: ${{ steps.package.outputs.dll_sha256 }}"
           Add-Content $env:GITHUB_STEP_SUMMARY "- ZIP SHA-256: ${{ steps.package.outputs.zip_sha256 }}"
-          Add-Content $env:GITHUB_STEP_SUMMARY "- Custom repo: https://raw.githubusercontent.com/yaaung-ai/KRWardrobeCleaner/main/repo.json"
-
-# v0.7 validation 2
-
-# v0.7 validation 3
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Dalamud 저장소 주소: https://raw.githubusercontent.com/pancakeLab/Himechan_addon/himechan/pluginmaster.json"

@@ -39,6 +39,8 @@ public sealed unsafe class DresserDuplicateCleaner
     public int Restored { get; private set; }
     public int Skipped { get; private set; }
     public int Failed { get; private set; }
+    public int Total => queue.Count;
+    public int Done => index;
     public string Status { get; private set; } = "환상의 옷장을 연 뒤 검색해 주세요.";
     public string? LastItemStatus { get; private set; }
 

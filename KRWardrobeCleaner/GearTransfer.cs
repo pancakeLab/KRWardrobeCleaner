@@ -5,7 +5,6 @@ using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 namespace KRWardrobeCleaner;
 
 public enum TransferDirection { ArmoryToBag = 0, BagToArmory = 1 }
-public enum FilterOp { And = 0, Or = 1 }
 
 public sealed record ArmoryCategory(InventoryType Container, string Label);
 
@@ -21,8 +20,7 @@ public sealed class TransferEntry
 
 /// <summary>
 /// 3. 장비함 ↔ 가방: moves gear between the armoury chest and the bags in either direction.
-/// Candidates can be auto-checked (and sorted to the top) by job / level / dresser-ownership filters
-/// that are combined left to right with AND / OR.
+/// Candidates are auto-checked (and sorted to the top) by the shared GearFilter.
 /// </summary>
 public sealed unsafe class GearTransfer
 {
@@ -42,11 +40,9 @@ public sealed unsafe class GearTransfer
         new(InventoryType.ArmorySoulCrystal, "소울 크리스탈"),
     ];
 
-    private const int SnapshotIntervalMs = 1000;
-
     private readonly ExcelIndex excel;
     private readonly InventoryScanner scanner;
-    private readonly OutfitCatalog outfits;
+    private readonly GearFilter filter;
     private readonly IPluginLog log;
     private readonly Configuration config;
     private readonly System.Action saveConfig;
@@ -54,8 +50,6 @@ public sealed unsafe class GearTransfer
     private readonly List<TransferEntry> entries = [];
     private readonly HashSet<ItemLocationKey> selected = [];
     private readonly Queue<PhysicalGearEntry> queue = new();
-    private HashSet<uint>? dresserSnapshot;
-    private long nextSnapshotAt;
     private long nextAt;
 
     public IReadOnlyList<TransferEntry> Entries => entries;
@@ -64,19 +58,18 @@ public sealed unsafe class GearTransfer
     public int Moved { get; private set; }
     public int Skipped { get; private set; }
     public int Failed { get; private set; }
+    public int Total { get; private set; }
+    public int Done => Moved + Skipped + Failed;
     public string Status { get; private set; } = "방향과 필터를 정한 뒤 검색해 주세요.";
     public string? LastItemStatus { get; private set; }
     public int MatchedCount => entries.Count(x => x.Matched);
     public int ExcludedByGearset => entries.Count(x => x.InGearset && ExcludesGearset);
 
-    public bool HasDresserData => dresserSnapshot != null;
-    public DateTimeOffset? DresserSnapshotAt { get; private set; }
-
-    public GearTransfer(ExcelIndex excel, InventoryScanner scanner, OutfitCatalog outfits, IPluginLog log, Configuration config, System.Action saveConfig)
+    public GearTransfer(ExcelIndex excel, InventoryScanner scanner, GearFilter filter, IPluginLog log, Configuration config, System.Action saveConfig)
     {
         this.excel = excel;
         this.scanner = scanner;
-        this.outfits = outfits;
+        this.filter = filter;
         this.log = log;
         this.config = config;
         this.saveConfig = saveConfig;
@@ -88,31 +81,14 @@ public sealed unsafe class GearTransfer
     public string SourceLabel => Direction == TransferDirection.BagToArmory ? "가방 1~4" : SourceCategory < 0 ? "장비함 전체" : Categories[SourceCategory].Label;
     public string DestinationLabel => Direction == TransferDirection.BagToArmory ? "장비함(부위별 자동)" : config.TransferToBag4Only ? "4번 가방" : "가방 빈칸";
     public int FreeDestinationSlots => Direction == TransferDirection.BagToArmory ? -1 : config.TransferToBag4Only ? scanner.CountFreeSlotsIn(InventoryType.Inventory4) : scanner.CountFreeBagSlots();
-    public IReadOnlyList<JobInfo> Jobs => excel.Jobs;
 
     public void Save() => saveConfig();
-
-    /// Keeps a copy of the dresser contents whenever the game has them loaded, so the dresser filter
-    /// still works after the dresser window is closed.
-    public void Observe()
-    {
-        var now = Environment.TickCount64;
-        if (now < nextSnapshotAt) return;
-        nextSnapshotAt = now + SnapshotIntervalMs;
-
-        var manager = MirageManager.Instance();
-        if (manager == null || !manager->PrismBoxLoaded) return;
-
-        dresserSnapshot = DresserContents.StoredItemIds(manager, outfits);
-        DresserSnapshotAt = DateTimeOffset.Now;
-    }
 
     public int Scan()
     {
         if (IsRunning) return entries.Count;
         entries.Clear();
         selected.Clear();
-        Observe();
 
         var gearsetIds = CollectGearsetItemIds();
         IEnumerable<PhysicalGearEntry> source = Direction switch
@@ -128,7 +104,7 @@ public sealed unsafe class GearTransfer
             {
                 Gear = gear,
                 JobText = excel.JobCategoryNameOf(gear.ItemId),
-                InDresser = dresserSnapshot?.Contains(gear.ItemId) ?? false,
+                InDresser = filter.InDresser(gear.ItemId),
                 InGearset = gearsetIds.Contains(gear.ItemId),
             });
         }
@@ -137,17 +113,17 @@ public sealed unsafe class GearTransfer
         return entries.Count;
     }
 
-    /// Re-evaluates the filters, checks matching rows and sorts them to the top.
+    /// Re-evaluates the shared filter, checks matching rows and sorts them to the top.
+    /// Without any filter every eligible row is checked (one-click move).
     public void ApplyFilters()
     {
-        var anyFilter = config.FilterJobEnabled || config.FilterLevelEnabled || config.FilterDresserEnabled;
-        var jobSet = BuildActiveJobSet();
+        if (IsRunning) return;
+        var anyFilter = filter.AnyEnabled;
 
         selected.Clear();
         foreach (var entry in entries)
         {
-            entry.Matched = anyFilter && Evaluate(entry, jobSet);
-            // No filter: everything eligible is checked (one-click move); with filters only the matches.
+            entry.Matched = anyFilter && filter.Matches(entry.Gear.ItemId, entry.Gear.RequiredLevel);
             if ((anyFilter ? entry.Matched : true) && !(entry.InGearset && ExcludesGearset))
                 selected.Add(entry.Gear.Key);
         }
@@ -159,46 +135,10 @@ public sealed unsafe class GearTransfer
             return c != 0 ? c : a.Gear.Key.Id.CompareTo(b.Gear.Key.Id);
         });
 
-        var dresserNote = config.FilterDresserEnabled && dresserSnapshot == null
-            ? " 옷장 데이터가 없어 옷장 필터는 '미보유'로 판정됩니다(환상의 옷장을 한 번 열어 주세요)."
-            : string.Empty;
+        var warning = filter.DresserWarning is { } w ? " " + w : string.Empty;
         Status = anyFilter
-            ? $"{SourceLabel}: 장비 {entries.Count}개 중 필터 일치 {MatchedCount}개, {selected.Count}개 체크됨 (장비세트 제외 {ExcludedByGearset}개).{dresserNote}"
-            : $"{SourceLabel}: 장비 {entries.Count}개. 필터를 켜면 자동으로 체크됩니다 (장비세트 제외 {ExcludedByGearset}개).";
-    }
-
-    private HashSet<string> BuildActiveJobSet()
-    {
-        var set = new HashSet<string>(config.FilterJobs, StringComparer.Ordinal);
-        foreach (var job in excel.Jobs)
-            if (set.Contains(job.Abbreviation) && !string.IsNullOrEmpty(job.ParentAbbreviation))
-                set.Add(job.ParentAbbreviation);   // a job's gear includes its base class' gear
-        return set;
-    }
-
-    private bool Evaluate(TransferEntry entry, HashSet<string> jobSet)
-    {
-        bool? result = null;
-
-        if (config.FilterJobEnabled)
-            Combine(ref result, FilterOp.And, excel.JobsOf(entry.Gear.ItemId).Overlaps(jobSet));
-
-        if (config.FilterLevelEnabled)
-        {
-            var level = entry.Gear.RequiredLevel;
-            Combine(ref result, (FilterOp)config.FilterLevelOp, level >= config.FilterLevelMin && level <= config.FilterLevelMax);
-        }
-
-        if (config.FilterDresserEnabled)
-            Combine(ref result, (FilterOp)config.FilterDresserOp, entry.InDresser == config.FilterDresserOwned);
-
-        return result ?? false;
-    }
-
-    private static void Combine(ref bool? result, FilterOp op, bool value)
-    {
-        if (result is null) result = value;
-        else result = op == FilterOp.Or ? result.Value || value : result.Value && value;
+            ? $"{SourceLabel}: 장비 {entries.Count}개 중 필터 일치 {MatchedCount}개 → {selected.Count}개 체크 (장비세트 제외 {ExcludedByGearset}개).{warning}"
+            : $"{SourceLabel}: 장비 {entries.Count}개, {selected.Count}개 체크 (장비세트 제외 {ExcludedByGearset}개). 필터를 켜면 조건에 맞는 것만 체크됩니다.";
     }
 
     public void SetSelected(ItemLocationKey key, bool value)
@@ -279,6 +219,7 @@ public sealed unsafe class GearTransfer
         queue.Clear();
         foreach (var gear in chosen) queue.Enqueue(gear);
         Moved = Skipped = Failed = 0;
+        Total = queue.Count;
         nextAt = 0;
         IsRunning = true;
         Status = $"{SourceLabel} → {DestinationLabel}: 장비 {queue.Count}개를 옮깁니다.";
@@ -293,7 +234,6 @@ public sealed unsafe class GearTransfer
 
     public void Tick()
     {
-        Observe();
         if (!IsRunning) return;
         var now = Environment.TickCount64;
         if (now < nextAt) return;
@@ -381,7 +321,7 @@ public sealed unsafe class GearTransfer
         return true;
     }
 
-    private static string CategoryLabel(InventoryType container)
+    public static string CategoryLabel(InventoryType container)
         => Categories.FirstOrDefault(x => x.Container == container)?.Label ?? container.ToString();
 
     private static string Describe(ItemLocationKey key)
