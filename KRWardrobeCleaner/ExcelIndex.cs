@@ -1,8 +1,12 @@
 using System.Collections;
 using System.Reflection;
 using Dalamud.Plugin.Services;
+using FFXIVClientStructs.FFXIV.Client.Game;
 
 namespace KRWardrobeCleaner;
+
+/// One class/job row from the ClassJob sheet (names come from the client language, i.e. Korean on the KR client).
+public sealed record JobInfo(uint RowId, string Abbreviation, string Name, int Role, string ParentAbbreviation);
 
 public sealed class ExcelIndex
 {
@@ -18,6 +22,25 @@ public sealed class ExcelIndex
         "GNB", "DNC", "RPR", "SGE", "VPR", "PCT", "BLU",
     };
 
+    // EquipSlotCategory column -> armoury chest container. Order matters: the first column with a
+    // positive value decides (e.g. a body piece that also blocks the head slot has Head = -1).
+    private static readonly (string Column, InventoryType Container)[] EquipSlotColumns =
+    [
+        ("MainHand", InventoryType.ArmoryMainHand),
+        ("OffHand", InventoryType.ArmoryOffHand),
+        ("Head", InventoryType.ArmoryHead),
+        ("Body", InventoryType.ArmoryBody),
+        ("Gloves", InventoryType.ArmoryHands),
+        ("Legs", InventoryType.ArmoryLegs),
+        ("Feet", InventoryType.ArmoryFeets),
+        ("Ears", InventoryType.ArmoryEar),
+        ("Neck", InventoryType.ArmoryNeck),
+        ("Wrists", InventoryType.ArmoryWrist),
+        ("FingerL", InventoryType.ArmoryRings),
+        ("FingerR", InventoryType.ArmoryRings),
+        ("SoulCrystal", InventoryType.ArmorySoulCrystal),
+    ];
+
     private readonly IDataManager data;
     private Dictionary<uint, string>? names;
     private Dictionary<uint, uint>? cabinetRows;
@@ -26,6 +49,11 @@ public sealed class ExcelIndex
     private HashSet<uint>? crafterGathererOnlyItems;
     private Dictionary<uint, int>? requiredLevels;
     private HashSet<uint>? outfitSetIds;
+    private Dictionary<uint, uint>? itemJobCategory;
+    private Dictionary<uint, (string Name, HashSet<string> Jobs)>? jobCategories;
+    private Dictionary<uint, uint>? itemEquipSlotCategory;
+    private Dictionary<uint, InventoryType>? equipSlotContainers;
+    private List<JobInfo>? jobs;
 
     public ExcelIndex(IDataManager data) => this.data = data;
 
@@ -37,6 +65,7 @@ public sealed class ExcelIndex
     public IReadOnlySet<uint> CrafterGathererOnlyItems => crafterGathererOnlyItems ??= BuildCrafterGathererOnlyItems();
     public IReadOnlyDictionary<uint, int> RequiredLevels => requiredLevels ??= BuildRequiredLevels();
     public IReadOnlySet<uint> OutfitSetIds => outfitSetIds ??= BuildOutfitSetIds();
+    public IReadOnlyList<JobInfo> Jobs => jobs ??= BuildJobs();
 
     public string NameOf(uint id)
         => Names.TryGetValue(id, out var name) && !string.IsNullOrWhiteSpace(name) ? name : $"아이템 #{id}";
@@ -47,6 +76,34 @@ public sealed class ExcelIndex
     public bool IsCrafterGathererOnly(uint itemId) => CrafterGathererOnlyItems.Contains(itemId);
     public int RequiredLevelOf(uint itemId) => RequiredLevels.TryGetValue(itemId, out var level) ? level : 0;
     public bool IsOutfitSetToken(uint itemId) => OutfitSetIds.Contains(itemId);
+
+    /// Display name of the item's ClassJobCategory (e.g. "백마도사 점성술사", "모든 클래스").
+    public string JobCategoryNameOf(uint itemId)
+    {
+        EnsureJobCategories();
+        return itemJobCategory!.TryGetValue(itemId, out var cat) && jobCategories!.TryGetValue(cat, out var info)
+            ? info.Name
+            : string.Empty;
+    }
+
+    /// Class/job abbreviations that may equip the item (empty when unknown).
+    public IReadOnlySet<string> JobsOf(uint itemId)
+    {
+        EnsureJobCategories();
+        return itemJobCategory!.TryGetValue(itemId, out var cat) && jobCategories!.TryGetValue(cat, out var info)
+            ? info.Jobs
+            : new HashSet<string>();
+    }
+
+    /// Armoury chest container the item belongs to, or null when it is not armoury gear.
+    public InventoryType? ArmoryContainerOf(uint itemId)
+    {
+        itemEquipSlotCategory ??= BuildItemEquipSlotCategories();
+        equipSlotContainers ??= BuildEquipSlotContainers();
+        return itemEquipSlotCategory.TryGetValue(itemId, out var cat) && equipSlotContainers.TryGetValue(cat, out var container)
+            ? container
+            : null;
+    }
 
     private IEnumerable GetSheet(string rowTypeName)
     {
@@ -144,41 +201,16 @@ public sealed class ExcelIndex
 
     private HashSet<uint> BuildCrafterGathererOnlyItems()
     {
+        EnsureJobCategories();
         var result = new HashSet<uint>();
-        foreach (var row in GetSheet("Item"))
+        foreach (var (itemId, cat) in itemJobCategory!)
         {
-            if (row is null) continue;
-            var itemId = ReadRowId(row);
-            if (itemId == 0) continue;
-
-            var categoryRef = row.GetType().GetProperty("ClassJobCategory")?.GetValue(row);
-            if (categoryRef is null) continue;
-
-            var category = ReadReferencedValue(categoryRef);
-            if (category is null) continue;
-
-            var hasCrafterGatherer = false;
-            var hasCombat = false;
-            foreach (var prop in category.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
-            {
-                if (prop.PropertyType != typeof(bool) || !prop.CanRead)
-                    continue;
-
-                bool enabled;
-                try { enabled = (bool)(prop.GetValue(category) ?? false); }
-                catch { continue; }
-                if (!enabled) continue;
-
-                if (CrafterGathererJobs.Contains(prop.Name))
-                    hasCrafterGatherer = true;
-                if (CombatJobs.Contains(prop.Name))
-                    hasCombat = true;
-            }
-
+            if (!jobCategories!.TryGetValue(cat, out var info)) continue;
+            var hasCrafterGatherer = info.Jobs.Overlaps(CrafterGathererJobs);
+            var hasCombat = info.Jobs.Overlaps(CombatJobs);
             if (hasCrafterGatherer && !hasCombat)
                 result.Add(itemId);
         }
-
         return result;
     }
 
@@ -195,21 +227,112 @@ public sealed class ExcelIndex
         return result;
     }
 
-    private static object? ReadReferencedValue(object reference)
+    private void EnsureJobCategories()
     {
-        var type = reference.GetType();
-        foreach (var name in new[] { "Value", "ValueNullable" })
+        if (itemJobCategory is not null && jobCategories is not null)
+            return;
+
+        var categories = new Dictionary<uint, (string Name, HashSet<string> Jobs)>();
+        foreach (var row in GetSheet("ClassJobCategory"))
         {
-            var prop = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance);
-            if (prop is null) continue;
-            try
+            if (row is null) continue;
+            var id = ReadRowId(row);
+            var name = row.GetType().GetProperty("Name")?.GetValue(row)?.ToString() ?? string.Empty;
+            var set = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var prop in row.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
             {
-                var value = prop.GetValue(reference);
-                if (value is not null) return value;
+                if (prop.PropertyType != typeof(bool) || !prop.CanRead) continue;
+                bool enabled;
+                try { enabled = (bool)(prop.GetValue(row) ?? false); }
+                catch { continue; }
+                if (enabled && (CombatJobs.Contains(prop.Name) || CrafterGathererJobs.Contains(prop.Name)))
+                    set.Add(prop.Name);
             }
-            catch { }
+            categories[id] = (name, set);
         }
-        return reference;
+
+        var byItem = new Dictionary<uint, uint>();
+        foreach (var row in GetSheet("Item"))
+        {
+            if (row is null) continue;
+            var itemId = ReadRowId(row);
+            if (itemId == 0) continue;
+            var categoryRef = row.GetType().GetProperty("ClassJobCategory")?.GetValue(row);
+            if (categoryRef is null) continue;
+            var cat = ReadRowId(categoryRef);
+            if (cat != 0) byItem[itemId] = cat;
+        }
+
+        jobCategories = categories;
+        itemJobCategory = byItem;
+    }
+
+    private Dictionary<uint, uint> BuildItemEquipSlotCategories()
+    {
+        var result = new Dictionary<uint, uint>();
+        foreach (var row in GetSheet("Item"))
+        {
+            if (row is null) continue;
+            var itemId = ReadRowId(row);
+            if (itemId == 0) continue;
+            var equipRef = row.GetType().GetProperty("EquipSlotCategory")?.GetValue(row);
+            if (equipRef is null) continue;
+            var cat = ReadRowId(equipRef);
+            if (cat != 0) result[itemId] = cat;
+        }
+        return result;
+    }
+
+    private Dictionary<uint, InventoryType> BuildEquipSlotContainers()
+    {
+        var result = new Dictionary<uint, InventoryType>();
+        foreach (var row in GetSheet("EquipSlotCategory"))
+        {
+            if (row is null) continue;
+            var id = ReadRowId(row);
+            if (id == 0) continue;
+
+            var type = row.GetType();
+            foreach (var (column, container) in EquipSlotColumns)
+            {
+                var raw = type.GetProperty(column)?.GetValue(row);
+                int value;
+                try { value = Convert.ToInt32(raw); }
+                catch { continue; }
+                if (value > 0)
+                {
+                    result[id] = container;
+                    break;
+                }
+            }
+        }
+        return result;
+    }
+
+    private List<JobInfo> BuildJobs()
+    {
+        var rows = new List<(uint Id, string Abbr, string Name, int Role, uint ParentId)>();
+        foreach (var row in GetSheet("ClassJob"))
+        {
+            if (row is null) continue;
+            var id = ReadRowId(row);
+            if (id == 0) continue;
+            var type = row.GetType();
+            var abbr = type.GetProperty("Abbreviation")?.GetValue(row)?.ToString() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(abbr)) continue;
+            var name = type.GetProperty("Name")?.GetValue(row)?.ToString() ?? abbr;
+            int role;
+            try { role = Convert.ToInt32(type.GetProperty("Role")?.GetValue(row)); }
+            catch { role = 0; }
+            var parentRef = type.GetProperty("ClassJobParent")?.GetValue(row);
+            var parentId = parentRef is null ? 0 : ReadRowId(parentRef);
+            rows.Add((id, abbr, name, role, parentId));
+        }
+
+        var abbrById = rows.ToDictionary(x => x.Id, x => x.Abbr);
+        return rows
+            .Select(x => new JobInfo(x.Id, x.Abbr, x.Name, x.Role, abbrById.TryGetValue(x.ParentId, out var p) ? p : string.Empty))
+            .ToList();
     }
 
     private static uint ReadRowId(object value)

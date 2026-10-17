@@ -69,6 +69,32 @@ public sealed class OutfitCatalog
     public IEnumerable<SetInfo> All => sets.Values;
 }
 
+/// Reads which base item ids the dresser currently holds (standalone slots plus pieces inside outfit sets).
+public static unsafe class DresserContents
+{
+    public static HashSet<uint> StoredItemIds(MirageManager* manager, OutfitCatalog outfits)
+    {
+        var result = new HashSet<uint>();
+        for (var i = 0; i < manager->PrismBoxItemIds.Length; i++)
+        {
+            var raw = manager->PrismBoxItemIds[i];
+            var id = raw >= 1_000_000 ? raw % 1_000_000 : raw;
+            if (id == 0) continue;
+
+            if (!outfits.TryGet(id, out var set))
+            {
+                result.Add(id);
+                continue;
+            }
+
+            for (var slot = 0; slot < set.ItemIds.Count; slot++)
+                if (set.ItemIds[slot] != 0 && manager->IsSetSlotUnlocked((uint)i, slot))
+                    result.Add(set.ItemIds[slot]);
+        }
+        return result;
+    }
+}
+
 public sealed unsafe class Stage2InventoryToDresser
 {
     private const ushort FullCondition = 30000;
@@ -672,26 +698,7 @@ public sealed unsafe class Stage2InventoryToDresser
         }
     }
 
-    private HashSet<uint> BuildStoredPieceSet(MirageManager* manager)
-    {
-        var result = new HashSet<uint>();
-        for (var i = 0; i < manager->PrismBoxItemIds.Length; i++)
-        {
-            var id = Normalize(manager->PrismBoxItemIds[i]);
-            if (id == 0) continue;
-
-            if (!outfits.TryGet(id, out var set))
-            {
-                result.Add(id);
-                continue;
-            }
-
-            for (var slot = 0; slot < set.ItemIds.Count; slot++)
-                if (set.ItemIds[slot] != 0 && manager->IsSetSlotUnlocked((uint)i, slot))
-                    result.Add(set.ItemIds[slot]);
-        }
-        return result;
-    }
+    private HashSet<uint> BuildStoredPieceSet(MirageManager* manager) => DresserContents.StoredItemIds(manager, outfits);
 
     private Dictionary<uint, uint> GetExistingSets(MirageManager* manager)
     {
