@@ -512,12 +512,14 @@ public sealed unsafe class Stage1DresserToInventory
 public sealed unsafe class Stage4Discard
 {
     private readonly InventoryScanner scanner;
+    private readonly GearFilter filter;
     private readonly IGameGui gameGui;
     private readonly Configuration config;
     private readonly System.Action saveConfig;
 
     private readonly List<PhysicalGearEntry> entries = [];
     private readonly HashSet<ItemLocationKey> selected = [];
+    private readonly HashSet<ItemLocationKey> matched = [];
     private readonly Queue<DiscardEntry> queue = new();
 
     private DiscardEntry? pending;
@@ -527,6 +529,8 @@ public sealed unsafe class Stage4Discard
 
     public IReadOnlyList<PhysicalGearEntry> Entries => entries;
     public IReadOnlySet<ItemLocationKey> Selected => selected;
+    public bool IsMatched(ItemLocationKey key) => matched.Contains(key);
+    public int MatchedCount => matched.Count;
     public bool IsRunning { get; private set; }
     public bool IsBag4Mode => IsRunning && mode == DiscardMode.Inventory4All;
     public int Discarded { get; private set; }
@@ -537,9 +541,10 @@ public sealed unsafe class Stage4Discard
     public string Status { get; private set; } = "파기 후보를 검색해 주세요.";
     public string? LastItemStatus { get; private set; }
 
-    public Stage4Discard(InventoryScanner scanner, IGameGui gameGui, Configuration config, System.Action saveConfig)
+    public Stage4Discard(InventoryScanner scanner, GearFilter filter, IGameGui gameGui, Configuration config, System.Action saveConfig)
     {
         this.scanner = scanner;
+        this.filter = filter;
         this.gameGui = gameGui;
         this.config = config;
         this.saveConfig = saveConfig;
@@ -558,8 +563,41 @@ public sealed unsafe class Stage4Discard
         entries.Clear();
         selected.Clear();
         entries.AddRange(scanner.Scan(includeBags: true, includeArmory: true));
-        Status = $"검색 완료: 장비함+인벤토리 장비 {entries.Count}개.";
+        ApplyFilters();
         return entries.Count;
+    }
+
+    /// Re-evaluates the shared filter: matching rows are checked and sorted to the top. Discarding is
+    /// irreversible, so with no filter nothing is checked automatically.
+    public void ApplyFilters()
+    {
+        if (IsRunning) return;
+        var anyFilter = filter.AnyEnabled;
+        matched.Clear();
+        selected.Clear();
+        if (anyFilter)
+        {
+            foreach (var entry in entries)
+            {
+                if (!filter.Matches(entry.ItemId, entry.RequiredLevel)) continue;
+                matched.Add(entry.Key);
+                selected.Add(entry.Key);
+            }
+        }
+
+        entries.Sort((a, b) =>
+        {
+            var ma = matched.Contains(a.Key);
+            var mb = matched.Contains(b.Key);
+            if (ma != mb) return ma ? -1 : 1;
+            var c = StringComparer.CurrentCulture.Compare(a.Name, b.Name);
+            return c != 0 ? c : a.Key.Id.CompareTo(b.Key.Id);
+        });
+
+        var warning = filter.DresserWarning is { } w ? " " + w : string.Empty;
+        Status = anyFilter
+            ? $"장비함+가방 장비 {entries.Count}개 중 필터 일치 {matched.Count}개를 체크했습니다. 확인 후 파기하세요.{warning}"
+            : $"검색 완료: 장비함+가방 장비 {entries.Count}개. 필터를 켜면 조건에 맞는 것만 체크됩니다.";
     }
 
     public void SetSelected(ItemLocationKey key, bool value)

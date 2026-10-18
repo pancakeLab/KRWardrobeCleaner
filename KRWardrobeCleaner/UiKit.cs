@@ -21,6 +21,8 @@ internal static class UiKit
     public static readonly Vector4 Muted = new(0.66f, 0.66f, 0.70f, 1f);
     public static readonly Vector4 Tag = new(0.62f, 0.78f, 1.00f, 1f);
     public static readonly Vector4 Lavender = new(0.76f, 0.70f, 0.98f, 1f);
+    public static readonly Vector4 BeigeBg = new(0.91f, 0.84f, 0.70f, 1f);
+    public static readonly Vector4 BeigeText = new(0.32f, 0.23f, 0.10f, 1f);
     public static readonly Vector4 CardBg = new(1f, 1f, 1f, 0.035f);
     public static readonly Vector4 CardBorder = new(1f, 1f, 1f, 0.10f);
 
@@ -146,6 +148,19 @@ internal static class UiKit
         var drawList = ImGui.GetWindowDrawList();
         drawList.AddRectFilled(pos, pos + size, ImGui.GetColorU32(new Vector4(color.X, color.Y, color.Z, 0.18f)), 6f);
         drawList.AddText(pos + pad, ImGui.GetColorU32(color), text);
+        ImGui.Dummy(size);
+    }
+
+    /// Chip with an opaque background (e.g. beige gear-set tag).
+    public static void SolidChip(string text, Vector4 background, Vector4 foreground, bool sameLine = false)
+    {
+        if (sameLine) ImGui.SameLine();
+        var pad = new Vector2(7, 2);
+        var size = ImGui.CalcTextSize(text) + pad * 2;
+        var pos = ImGui.GetCursorScreenPos();
+        var drawList = ImGui.GetWindowDrawList();
+        drawList.AddRectFilled(pos, pos + size, ImGui.GetColorU32(background), 6f);
+        drawList.AddText(pos + pad, ImGui.GetColorU32(foreground), text);
         ImGui.Dummy(size);
     }
 

@@ -10,8 +10,8 @@ namespace KRWardrobeCleaner;
 
 public sealed partial class Plugin : IDalamudPlugin
 {
-    private const string VersionLabel = "v0.12.1";
-    private static readonly string[] CommandNames = ["/kwc", "/가방"];
+    private const string VersionLabel = "v0.12.2";
+    private static readonly string[] CommandNames = ["/히메짱가방"];
 
     [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
     [PluginService] internal static ICommandManager Commands { get; private set; } = null!;
@@ -35,6 +35,7 @@ public sealed partial class Plugin : IDalamudPlugin
     private readonly GearTransfer transfer;
     private readonly Stage4Discard stage4;
     private readonly CallbackRecorder recorder;
+    private readonly GearsetIndex gearsets = new();
 
     private bool windowOpen = true;
     private bool filterPanelOpen = true;
@@ -55,7 +56,7 @@ public sealed partial class Plugin : IDalamudPlugin
         duplicates = new DresserDuplicateCleaner(excel, outfits, GameGui, Log, config, SaveConfig);
         stage2 = new Stage2InventoryToDresser(excel, scanner, outfits, filter, GameGui, Objects, Condition, Log, config, SaveConfig);
         transfer = new GearTransfer(excel, scanner, filter, Log, config, SaveConfig);
-        stage4 = new Stage4Discard(scanner, GameGui, config, SaveConfig);
+        stage4 = new Stage4Discard(scanner, filter, GameGui, config, SaveConfig);
         recorder = new CallbackRecorder(Interop, Log);
 
         foreach (var command in CommandNames)
@@ -125,6 +126,7 @@ public sealed partial class Plugin : IDalamudPlugin
         SaveConfig();
         stage2.ApplyFilters();
         transfer.ApplyFilters();
+        stage4.ApplyFilters();
     }
 
 }

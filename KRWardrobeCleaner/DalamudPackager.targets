@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Same as the Dalamud.NET.Sdk default packager targets, except HandleImages="false": the images folder
+     (icon.png) then stays inside latest.zip so the installed plugin carries its own icon. -->
+<Project>
+    <Target Name="KwcDalamudPackager"
+            AfterTargets="Build">
+        <DalamudPackager ProjectDir="$(ProjectDir)"
+                         OutputPath="$(OutputPath)"
+                         AssemblyName="$(AssemblyName)"
+                         MakeZip="true"
+                         HandleImages="false"
+                         Author="$(Author)"
+                         Name="$(Name)"
+                         MinimumDalamudVersion="$(MinimumDalamudVersion)"
+                         Punchline="$(Punchline)"
+                         Description="$(Description)"
+                         ApplicableVersion="$(ApplicableVersion)"
+                         RepoUrl="$(RepoUrl)"
+                         Tags="$(Tags)"
+                         CategoryTags="$(CategoryTags)"
+                         DalamudApiLevel="$(DalamudApiLevel)"
+                         LoadRequiredState="$(LoadRequiredState)"
+                         LoadSync="$(LoadSync)"
+                         CanUnloadAsync="$(CanUnloadAsync)"
+                         LoadPriority="$(LoadPriority)"
+                         ImageUrls="$(ImageUrls)"
+                         IconUrl="$(IconUrl)"
+                         Changelog="$(Changelog)"
+                         AcceptsFeedback="$(AcceptsFeedback)"
+                         FeedbackMessage="$(FeedbackMessage)" />
+    </Target>
+</Project>

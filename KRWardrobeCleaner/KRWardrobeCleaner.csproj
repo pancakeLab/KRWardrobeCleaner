@@ -1,6 +1,6 @@
 <Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
-    <Version>0.12.1.0</Version>
+    <Version>0.12.2.0</Version>
     <TargetFramework>net10.0-windows</TargetFramework>
     <Platforms>x64</Platforms>
     <PlatformTarget>x64</PlatformTarget>
@@ -16,5 +16,9 @@
     <Description>만사가 귀찮은 공주님들을 위한 자동 정리 집사님!</Description>
     <RepoUrl>https://github.com/pancakeLab/KRWardrobeCleaner</RepoUrl>
     <Tags>glamour;inventory;armoire;utility</Tags>
+    <IconUrl>https://raw.githubusercontent.com/pancakeLab/KRWardrobeCleaner/main/KRWardrobeCleaner/images/icon.png</IconUrl>
   </PropertyGroup>
+  <ItemGroup>
+    <Content Include="images/icon.png" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>

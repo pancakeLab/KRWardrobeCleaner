@@ -46,6 +46,7 @@ public sealed partial class Plugin
         var visible = ImGui.Begin("히메짱 옷장 정리기###KRWardrobeCleaner", ref windowOpen, ImGuiWindowFlags.NoScrollbar);
         if (visible)
         {
+            gearsets.Refresh();
             DrawHeader();
             ImGui.PushStyleVar(ImGuiStyleVar.TabRounding, 6f);
             if (ImGui.BeginTabBar("KWCStages", ImGuiTabBarFlags.FittingPolicyScroll))
@@ -202,6 +203,14 @@ public sealed partial class Plugin
         }
         ImGui.SameLine(0, 6);
         ImGui.AlignTextToFramePadding();
+    }
+
+    /// Beige "장비 세트 사용중: N번" chip when any gear set references the item.
+    private void GearsetChip(uint itemId, bool sameLine, string? suffix = null)
+    {
+        var label = gearsets.Label(itemId);
+        if (label == null) return;
+        UiKit.SolidChip(label + suffix, UiKit.BeigeBg, UiKit.BeigeText, sameLine);
     }
 
     private static string Where(InventoryType type)
@@ -451,8 +460,10 @@ public sealed partial class Plugin
             ImGui.AlignTextToFramePadding();
             ImGui.TextUnformatted(entry.RequiredLevel.ToString());
             ImGui.TableNextColumn();
+            var s2chips = (reason != null ? 1 : 0) + (stage2.HasOutfit(entry.ItemId) ? 1 : 0) + (entry.IsDyed ? 1 : 0) + (reason == null && entry.MateriaCount > 0 ? 1 : 0);
             UiKit.Chips((reason != null, reason ?? string.Empty, UiKit.Warn), (stage2.HasOutfit(entry.ItemId), "세트 가능", UiKit.Lavender),
                 (entry.IsDyed, "염색됨", UiKit.Tag), (reason == null && entry.MateriaCount > 0, $"마테리아 {entry.MateriaCount}", UiKit.Tag));
+            GearsetChip(entry.ItemId, s2chips > 0);
         }
         EndList();
     }
@@ -548,8 +559,10 @@ public sealed partial class Plugin
             ImGui.AlignTextToFramePadding();
             UiKit.MutedText(entry.JobText);
             ImGui.TableNextColumn();
-            UiKit.Chips((entry.InDresser, "옷장 보유", UiKit.Lavender), (entry.InGearset, excluded ? "장비세트 (제외)" : "장비세트", UiKit.Busy),
-                (gear.IsDyed, "염색됨", UiKit.Tag), (gear.IsCrafterGatherer, "제작/채집", UiKit.Tag));
+            var trchips = (entry.InDresser ? 1 : 0) + (gear.IsDyed ? 1 : 0) + (gear.IsCrafterGatherer ? 1 : 0);
+            UiKit.Chips((entry.InDresser, "옷장 보유", UiKit.Lavender), (gear.IsDyed, "염색됨", UiKit.Tag), (gear.IsCrafterGatherer, "제작/채집", UiKit.Tag));
+            if (entry.InGearset && gearsets.Label(gear.ItemId) == null) UiKit.Chip(excluded ? "장비세트 (제외)" : "장비세트", UiKit.Busy, trchips > 0);
+            else GearsetChip(gear.ItemId, trchips > 0, excluded ? " (제외)" : null);
         }
         EndList();
     }
@@ -569,7 +582,7 @@ public sealed partial class Plugin
         ImGui.SetNextItemOpen(filterPanelOpen, ImGuiCond.Always);
         var open = ImGui.TreeNodeEx($"필터: {filter.Describe()}###filterpanel", ImGuiTreeNodeFlags.SpanAvailWidth | ImGuiTreeNodeFlags.NoTreePushOnOpen);
         if (ImGui.IsItemToggledOpen()) filterPanelOpen = !filterPanelOpen;
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip("2번·3번 탭이 같은 필터를 씁니다. 켜진 필터를 위에서 아래로 '그리고(AND)' 또는 '또는(OR)'로 묶고, 조건에 맞는 장비는 초록색으로 표시되며 자동으로 체크됩니다.");
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("2번·3번·4번 탭이 같은 필터를 씁니다. 켜진 필터를 위에서 아래로 '그리고(AND)' 또는 '또는(OR)'로 묶고, 조건에 맞는 장비는 초록색으로 표시되며 자동으로 체크됩니다.");
         if (!open)
         {
             UiKit.EndCard();
@@ -588,8 +601,20 @@ public sealed partial class Plugin
             if (ImGui.SmallButton("모두 해제##f1clear")) { config.FilterJobs.Clear(); FilterChanged(); }
             foreach (var (group, jobs) in JobGroups)
             {
-                UiKit.MutedText(group);
-                ImGui.SameLine(80);
+                // group checkbox: checked when every job of the group is selected; toggles the whole group
+                var allOn = jobs.All(config.FilterJobs.Contains);
+                var someOn = !allOn && jobs.Any(config.FilterJobs.Contains);
+                if (someOn) ImGui.PushStyleColor(ImGuiCol.CheckMark, UiKit.Muted);
+                var groupOn = allOn || someOn;
+                if (ImGui.Checkbox($"{group}##f1g-{group}", ref groupOn))
+                {
+                    if (allOn) foreach (var abbr in jobs) config.FilterJobs.Remove(abbr);
+                    else foreach (var abbr in jobs) config.FilterJobs.Add(abbr);
+                    FilterChanged();
+                }
+                if (someOn) ImGui.PopStyleColor();
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(allOn ? "그룹 전체 해제" : "그룹 전체 선택");
+                ImGui.SameLine(110);
                 var first = true;
                 foreach (var abbr in jobs)
                 {
@@ -687,10 +712,11 @@ public sealed partial class Plugin
     private void DrawStage4()
     {
         Summary("장비함과 가방의 장비를 체크해 자동으로 파기합니다. 되돌릴 수 없으니 확인 창을 거칩니다.",
-            "확인 창은 자동으로 '예'를 누릅니다. '4번 가방 전체 파기'는 장비가 아닌 아이템도 포함해 4번 가방의 모든 칸을 비웁니다. '스마트 선택'은 착용 레벨 이하의 장비를 고릅니다.");
+            "확인 창은 자동으로 '예'를 누릅니다. 필터를 켜면 조건에 맞는 장비(예: 환상의 옷장에 이미 있는 장비)만 체크됩니다. '4번 가방 전체 파기'는 장비가 아닌 아이템도 포함해 4번 가방의 모든 칸을 비웁니다. '스마트 선택'은 착용 레벨 이하의 장비를 고릅니다.");
 
         var running = stage4.IsRunning;
         ImGui.BeginDisabled(running);
+        DrawFilterPanel();
         if (UiKit.Button(FontAwesomeIcon.Search, "후보 검색", "s4scan")) stage4.Scan();
         ImGui.SameLine();
         if (UiKit.Button(FontAwesomeIcon.Magic, "스마트 선택", "s4smart")) stage4.SmartSelect();
@@ -730,7 +756,7 @@ public sealed partial class Plugin
         if (running && StopButton("s4stop")) stage4.Stop();
 
         StatusBlock(stage4.Status, stage4.LastItemStatus, running, stage4.Done, stage4.Total);
-        ListToolbar(list4, stage4.Selected.Count, stage4.Entries.Count);
+        ListToolbar(list4, stage4.Selected.Count, stage4.Entries.Count, stage4.MatchedCount);
 
         if (!BeginList("Stage4List", ("", 28), ("아이템", -3), ("위치", 110), ("Lv", 40), ("비고", -1.2f))) return;
         foreach (var entry in stage4.Entries)
@@ -743,7 +769,8 @@ public sealed partial class Plugin
                 stage4.SetSelected(entry.Key, selected);
             ImGui.TableNextColumn();
             ItemIcon(entry.ItemId);
-            ImGui.TextUnformatted(entry.Name);
+            if (stage4.IsMatched(entry.Key)) ImGui.TextColored(UiKit.Ok, entry.Name);
+            else ImGui.TextUnformatted(entry.Name);
             ImGui.TableNextColumn();
             ImGui.AlignTextToFramePadding();
             UiKit.MutedText(Where(entry.Key.Container));
@@ -751,7 +778,9 @@ public sealed partial class Plugin
             ImGui.AlignTextToFramePadding();
             ImGui.TextUnformatted(entry.RequiredLevel.ToString());
             ImGui.TableNextColumn();
+            var s4chips = (entry.IsDyed ? 1 : 0) + (entry.IsCrafterGatherer ? 1 : 0) + (entry.HasMateria ? 1 : 0);
             UiKit.Chips((entry.IsDyed, "염색됨", UiKit.Tag), (entry.IsCrafterGatherer, "제작/채집", UiKit.Tag), (entry.HasMateria, "마테리아", UiKit.Tag));
+            GearsetChip(entry.ItemId, s4chips > 0);
         }
         EndList();
     }
