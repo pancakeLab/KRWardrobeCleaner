@@ -51,7 +51,7 @@ public sealed partial class Plugin
             ImGui.PushStyleVar(ImGuiStyleVar.TabRounding, 6f);
             if (ImGui.BeginTabBar("KWCStages", ImGuiTabBarFlags.FittingPolicyScroll))
             {
-                DrawTab("1 · 옷장 → 가방", DrawStage1, "환상의 옷장에서 추억의 보관함 대상 아이템을 가방으로 꺼냅니다.");
+                DrawTab("1 · 옷장 → 가방·장비함", DrawStage1Tab, "환상의 옷장에서 아이템을 꺼냅니다: 추억의 보관함 후보, 또는 필터로 고른 아이템(세트 조각 포함)을 장비함으로.");
                 DrawTab("1-2 · 옷장 중복", DrawDuplicates, "환상의 옷장에 두 벌 이상 든 아이템의 중복분을 가방으로 꺼냅니다.");
                 DrawTab("2 · 가방 → 옷장", DrawStage2, "장비함·가방의 장비를 환상의 옷장(세트 우선)에 넣습니다.");
                 DrawTab("3 · 장비함 ↔ 가방", DrawTransfer, "장비함과 가방 사이에서 장비를 옮깁니다.");
@@ -249,7 +249,86 @@ public sealed partial class Plugin
         ImGui.PopStyleVar();
     }
 
-    // ------------------------------------------------------------------ 1. 옷장 → 가방
+    // ------------------------------------------------------------------ 1. 옷장 → 가방·장비함
+
+    private void DrawStage1Tab()
+    {
+        var busy = stage1.IsRunning || pull.IsRunning;
+        ImGui.BeginDisabled(busy);
+        ImGui.AlignTextToFramePadding();
+        UiKit.MutedText("꺼낼 기준");
+        ImGui.SameLine();
+        if (ImGui.RadioButton("추억의 보관함 후보##s1m0", config.Stage1Mode == 0)) { config.Stage1Mode = 0; SaveConfig(); }
+        ImGui.SameLine();
+        if (ImGui.RadioButton("필터로 고르기 (세트 조각 포함, 장비함으로)##s1m1", config.Stage1Mode == 1)) { config.Stage1Mode = 1; SaveConfig(); }
+        ImGui.EndDisabled();
+        ImGui.Spacing();
+
+        if (config.Stage1Mode == 1) DrawDresserPull();
+        else DrawStage1();
+    }
+
+    private void DrawDresserPull()
+    {
+        Summary("환상의 옷장에 든 아이템(의상 세트 안의 조각 포함)을 필터로 골라 꺼내고, 옷장을 닫은 뒤 장비함으로 옮깁니다.",
+            "예: 직업 필터 '탱커' + 레벨 50~80을 켜면 레벨업용 탱커 장비가 세트 안에 있어도 전부 체크됩니다. 꺼낸 아이템은 먼저 가방으로 들어오므로 가방 빈칸이 필요합니다. " +
+            "장비함으로 옮기려면 게임이 옷장을 닫아야 해서 꺼낸 뒤 자동으로 닫습니다. 다 쓰고 나면 2번 탭에서 다시 세트로 넣을 수 있습니다.");
+
+        var running = pull.IsRunning;
+        ImGui.BeginDisabled(running);
+        DrawFilterPanel();
+
+        if (UiKit.Button(FontAwesomeIcon.Search, "옷장 검색", "pullscan")) pull.Scan();
+        ImGui.SameLine();
+        if (UiKit.Button(FontAwesomeIcon.CheckSquare, "전체", "pullall")) pull.SelectAll(true);
+        ImGui.SameLine();
+        if (UiKit.Button(FontAwesomeIcon.Square, "해제", "pullnone")) pull.SelectAll(false);
+        if (BeginOptions("pullopt"))
+        {
+            var toArmory = config.PullToArmory;
+            if (ImGui.Checkbox("꺼낸 뒤 옷장을 닫고 장비함으로 옮기기##pullarm", ref toArmory))
+                pull.SetPullToArmory(toArmory);
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("끄면 가방에 둡니다. 켜면 옷장이 닫힌 뒤 부위별 장비함 칸으로 옮깁니다(칸이 가득 차면 가방에 남김).");
+            EndOptions();
+        }
+        var goLabel = config.PullToArmory ? $"꺼내서 장비함으로 ({pull.Selected.Count}개)" : $"가방으로 꺼내기 ({pull.Selected.Count}개)";
+        UiKit.AlignRight(UiKit.ButtonSize(FontAwesomeIcon.Play, goLabel).X);
+        if (UiKit.Button(FontAwesomeIcon.Play, goLabel, "pullgo", 1) && CanStart(running))
+            pull.Start();
+        ImGui.EndDisabled();
+        if (running && StopButton("pullstop")) pull.Stop();
+
+        StatusBlock(pull.Status, pull.LastItemStatus, running, pull.Done, pull.Total);
+        ListToolbar(listPull, pull.Selected.Count, pull.Entries.Count, pull.MatchedCount);
+
+        if (!BeginList("PullList", ("", 28), ("아이템", -3), ("세트", -1.8f), ("Lv", 40), ("직업", -1.6f), ("비고", -1f))) return;
+        foreach (var entry in pull.Entries)
+        {
+            var selected = pull.Selected.Contains(entry.Id);
+            if (!listPull.Show(entry.Name, selected)) continue;
+            ImGui.TableNextRow();
+            ImGui.TableNextColumn();
+            if (ImGui.Checkbox($"##pull-{entry.Id}", ref selected))
+                pull.SetSelected(entry.Id, selected);
+            ImGui.TableNextColumn();
+            ItemIcon(entry.ItemId);
+            if (pull.IsMatched(entry.Id)) ImGui.TextColored(UiKit.Ok, entry.Name);
+            else ImGui.TextUnformatted(entry.Name);
+            ImGui.TableNextColumn();
+            ImGui.AlignTextToFramePadding();
+            if (entry.SetName != null) ImGui.TextColored(UiKit.Lavender, entry.SetName);
+            else UiKit.MutedText("단벌");
+            ImGui.TableNextColumn();
+            ImGui.AlignTextToFramePadding();
+            ImGui.TextUnformatted(entry.RequiredLevel.ToString());
+            ImGui.TableNextColumn();
+            ImGui.AlignTextToFramePadding();
+            UiKit.MutedText(entry.JobText);
+            ImGui.TableNextColumn();
+            UiKit.Chips((entry.IsDyed, "염색됨", UiKit.Tag));
+        }
+        EndList();
+    }
 
     private void DrawStage1()
     {
@@ -582,7 +661,7 @@ public sealed partial class Plugin
         ImGui.SetNextItemOpen(filterPanelOpen, ImGuiCond.Always);
         var open = ImGui.TreeNodeEx($"필터: {filter.Describe()}###filterpanel", ImGuiTreeNodeFlags.SpanAvailWidth | ImGuiTreeNodeFlags.NoTreePushOnOpen);
         if (ImGui.IsItemToggledOpen()) filterPanelOpen = !filterPanelOpen;
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip("2번·3번·4번 탭이 같은 필터를 씁니다. 켜진 필터를 위에서 아래로 '그리고(AND)' 또는 '또는(OR)'로 묶고, 조건에 맞는 장비는 초록색으로 표시되며 자동으로 체크됩니다.");
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("1(필터 모드)·2·3·4번 탭이 같은 필터를 씁니다. 켜진 필터를 위에서 아래로 '그리고(AND)' 또는 '또는(OR)'로 묶고, 조건에 맞는 장비는 초록색으로 표시되며 자동으로 체크됩니다.");
         if (!open)
         {
             UiKit.EndCard();

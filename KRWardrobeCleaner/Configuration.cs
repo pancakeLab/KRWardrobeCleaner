@@ -8,6 +8,10 @@ public sealed class Configuration : IPluginConfiguration
 
     public bool Stage1IncludeDyed { get; set; }
     public bool Stage1IncludePlateRegistered { get; set; }
+    /// 1번 탭 모드. 0 = 추억의 보관함 후보, 1 = 필터로 고르기(옷장 → 가방·장비함).
+    public int Stage1Mode { get; set; }
+    /// 필터 모드: 꺼낸 아이템을 옷장을 닫고 장비함으로 옮긴다.
+    public bool PullToArmory { get; set; } = true;
 
     public bool Stage2IncludeDyed { get; set; }
     /// 마테리아가 장착된 장비도 환상의 옷장 저장을 시도한다(게임이 거절할 수 있음). 기본 꺼짐.
