@@ -16,6 +16,7 @@ public sealed partial class Plugin
         ("근접", ["MNK", "DRG", "NIN", "SAM", "RPR", "VPR"]),
         ("원거리", ["BRD", "MCH", "DNC"]),
         ("마법", ["BLM", "SMN", "RDM", "PCT", "BLU"]),
+        ("기본 클래스", ["GLA", "MRD", "PGL", "LNC", "ROG", "ARC", "CNJ", "THM", "ACN"]),
         ("제작", ["CRP", "BSM", "ARM", "GSM", "LTW", "WVR", "ALC", "CUL"]),
         ("채집", ["MIN", "BTN", "FSH"]),
     ];

@@ -29,6 +29,7 @@ public sealed unsafe class DresserDuplicateCleaner
     private readonly List<DresserDuplicateEntry> entries = [];
     private readonly HashSet<int> selected = [];
     private readonly List<(int Slot, uint ItemId, string Name)> queue = [];
+    private readonly RestoreGate gate = new();
     private int index;
     private long nextAt;
 
@@ -200,6 +201,7 @@ public sealed unsafe class DresserDuplicateCleaner
 
         index = Restored = Skipped = Failed = 0;
         nextAt = 0;
+        gate.Reset();
         IsRunning = true;
         Status = $"체크한 중복분 {queue.Count}개를 가방으로 되돌립니다.";
         return true;
@@ -246,6 +248,12 @@ public sealed unsafe class DresserDuplicateCleaner
             return;
         }
 
+        if (!gate.Ready(manager, log, config.DebugLog))
+        {
+            nextAt = now + 100;
+            return;
+        }
+
         var (slot, expectedItemId, name) = queue[index];
         if (slot < 0 || slot >= manager->PrismBoxItemIds.Length || Normalize(manager->PrismBoxItemIds[slot]) != expectedItemId)
         {
@@ -255,7 +263,14 @@ public sealed unsafe class DresserDuplicateCleaner
         else if (manager->RestorePrismBoxItem((uint)slot))
         {
             Restored++;
+            gate.Arm(slot, -1, expectedItemId);
             LastItemStatus = $"{name}: 가방으로 되돌리기 요청 완료.";
+        }
+        else if (gate.AllowRetry())
+        {
+            LastItemStatus = $"{name}: 게임이 이전 요청을 아직 처리 중이라 다시 시도합니다 ({gate.Retries}/{RestoreGate.MaxRetries}).";
+            nextAt = now + RestoreGate.RetryIntervalMs;
+            return;
         }
         else
         {

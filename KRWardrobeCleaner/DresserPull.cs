@@ -53,9 +53,11 @@ public sealed unsafe class DresserPull
     private readonly Queue<PhysicalGearEntry> moveQueue = new();
 
     private Phase phase;
+    private readonly RestoreGate gate = new();
     private int index;
     private long nextAt;
     private long phaseAt;
+    private long loadWaitSince;
 
     public IReadOnlyList<DresserPullEntry> Entries => entries;
     public IReadOnlySet<string> Selected => selected;
@@ -226,6 +228,7 @@ public sealed unsafe class DresserPull
         moveQueue.Clear();
 
         index = Restored = Moved = Skipped = Failed = 0;
+        gate.Reset();
         Total = queue.Count;
         nextAt = 0;
         phase = Phase.Restore;
@@ -315,15 +318,31 @@ public sealed unsafe class DresserPull
 
         var manager = MirageManager.Instance();
         var inventory = InventoryManager.Instance();
-        if (manager == null || inventory == null || !manager->PrismBoxLoaded)
+        if (manager == null || inventory == null)
         {
             Stop("환상의 옷장 또는 인벤토리 데이터를 잃어 작업을 중지했습니다.");
             return;
         }
 
+        // The client may reload the dresser after a restore; wait for it instead of giving up.
+        if (!manager->PrismBoxLoaded)
+        {
+            if (loadWaitSince == 0) loadWaitSince = now;
+            if (now - loadWaitSince > 8000) { Stop("환상의 옷장 데이터를 다시 읽지 못해 작업을 중지했습니다."); return; }
+            nextAt = now + 100;
+            return;
+        }
+        loadWaitSince = 0;
+
         if (inventory->GetEmptySlotsInBag() == 0)
         {
             Stop("가방 빈칸이 없어 작업을 중지했습니다.");
+            return;
+        }
+
+        if (!gate.Ready(manager, log, config.DebugLog))
+        {
+            nextAt = now + 100;
             return;
         }
 
@@ -366,8 +385,17 @@ public sealed unsafe class DresserPull
             if (ok)
             {
                 Restored++;
+                gate.Arm(slot, entry.SetSlot, entry.ItemId);
                 restoredCounts[entry.ItemId] = restoredCounts.GetValueOrDefault(entry.ItemId) + 1;
                 result = entry.SetSlot >= 0 ? $"세트 '{entry.SetName}'에서 꺼내기 요청 완료." : "가방으로 꺼내기 요청 완료.";
+            }
+            else if (gate.AllowRetry())
+            {
+                LastItemStatus = $"{entry.Name}: 게임이 이전 요청을 아직 처리 중이라 다시 시도합니다 ({gate.Retries}/{RestoreGate.MaxRetries}).";
+                if (config.DebugLog)
+                    log.Information("[KWC] pull restore slot {Slot} refused, retry {Retry} (loaded={Loaded}, busy={Busy})", slot, gate.Retries, manager->PrismBoxLoaded, RestoreGate.IsBusy(manager));
+                nextAt = now + RestoreGate.RetryIntervalMs;
+                return;
             }
             else
             {

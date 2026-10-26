@@ -10,7 +10,7 @@ namespace KRWardrobeCleaner;
 
 public sealed partial class Plugin : IDalamudPlugin
 {
-    private const string VersionLabel = "v0.13.0";
+    private const string VersionLabel = "v0.13.1";
     private static readonly string[] CommandNames = ["/히메짱가방"];
 
     [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;

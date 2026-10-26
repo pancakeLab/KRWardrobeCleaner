@@ -308,6 +308,7 @@ public sealed unsafe class Stage1DresserToInventory
     private readonly List<DresserArmoireEntry> entries = [];
     private readonly HashSet<int> selected = [];
     private readonly List<(int Slot, uint ItemId)> queue = [];
+    private readonly RestoreGate gate = new();
     private int index;
     private long nextAt;
 
@@ -431,6 +432,7 @@ public sealed unsafe class Stage1DresserToInventory
 
         index = Restored = Skipped = Failed = 0;
         nextAt = 0;
+        gate.Reset();
         LastItemStatus = null;
         IsRunning = true;
         Status = $"체크한 항목 {queue.Count}개를 인벤토리로 옮깁니다.";
@@ -478,6 +480,12 @@ public sealed unsafe class Stage1DresserToInventory
             return;
         }
 
+        if (!gate.Ready(manager, null, false))
+        {
+            nextAt = now + 100;
+            return;
+        }
+
         var (slot, expectedItemId) = queue[index];
         if (slot < 0 || slot >= manager->PrismBoxItemIds.Length || Normalize(manager->PrismBoxItemIds[slot]) != expectedItemId)
         {
@@ -487,7 +495,14 @@ public sealed unsafe class Stage1DresserToInventory
         else if (manager->RestorePrismBoxItem((uint)slot))
         {
             Restored++;
+            gate.Arm(slot, -1, expectedItemId);
             LastItemStatus = $"{excel.NameOf(expectedItemId)}: 인벤토리 복원 요청 완료.";
+        }
+        else if (gate.AllowRetry())
+        {
+            LastItemStatus = $"{excel.NameOf(expectedItemId)}: 게임이 이전 요청을 아직 처리 중이라 다시 시도합니다 ({gate.Retries}/{RestoreGate.MaxRetries}).";
+            nextAt = now + RestoreGate.RetryIntervalMs;
+            return;
         }
         else
         {
