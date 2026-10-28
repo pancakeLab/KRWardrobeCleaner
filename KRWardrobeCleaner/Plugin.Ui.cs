@@ -290,6 +290,10 @@ public sealed partial class Plugin
             if (ImGui.Checkbox("꺼낸 뒤 옷장을 닫고 장비함으로 옮기기##pullarm", ref toArmory))
                 pull.SetPullToArmory(toArmory);
             if (ImGui.IsItemHovered()) ImGui.SetTooltip("끄면 가방에 둡니다. 켜면 옷장이 닫힌 뒤 부위별 장비함 칸으로 옮깁니다(칸이 가득 차면 가방에 남김).");
+            var whole = config.PullWholeSets;
+            if (ImGui.Checkbox("세트 단위로 꺼내기##pullwhole", ref whole))
+                pull.SetPullWholeSets(whole);
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("의상 세트의 조각 중 하나라도 필터에 맞으면 그 세트의 조각 전체를 체크합니다(끄면 맞는 조각만).");
             EndOptions();
         }
         var goLabel = config.PullToArmory ? $"꺼내서 장비함으로 ({pull.Selected.Count}개)" : $"가방으로 꺼내기 ({pull.Selected.Count}개)";
@@ -326,7 +330,7 @@ public sealed partial class Plugin
             ImGui.AlignTextToFramePadding();
             UiKit.MutedText(entry.JobText);
             ImGui.TableNextColumn();
-            UiKit.Chips((entry.IsDyed, "염색됨", UiKit.Tag));
+            UiKit.Chips((pull.IsCompanion(entry.Id), "같은 세트", UiKit.Lavender), (entry.IsDyed, "염색됨", UiKit.Tag));
         }
         EndList();
     }
@@ -516,6 +520,20 @@ public sealed partial class Plugin
         if (running && StopButton("s2stop")) stage2.Stop();
 
         StatusBlock(stage2.Status, stage2.LastItemStatus, running, stage2.Done, stage2.Total);
+        if (stage2.RunLog.Count > 0 && ImGui.TreeNodeEx($"실행 기록 ({stage2.RunLog.Count}줄)###s2runlog", ImGuiTreeNodeFlags.SpanAvailWidth))
+        {
+            if (ImGui.BeginChild("s2runlogchild", new Vector2(0, 120), true))
+            {
+                for (var i = stage2.RunLog.Count - 1; i >= 0 && i >= stage2.RunLog.Count - 100; i--)
+                {
+                    var line = stage2.RunLog[i];
+                    var bad = line.Contains("실패") || line.Contains("건너뜁니다") || line.Contains("거절") || line.Contains("않았습니다") || line.Contains("않아");
+                    ImGui.TextColored(bad ? UiKit.Warn : UiKit.Muted, line);
+                }
+            }
+            ImGui.EndChild();
+            ImGui.TreePop();
+        }
         ListToolbar(list2, stage2.Selected.Count, stage2.Entries.Count, stage2.Entries.Count(e => stage2.IsMatched(e.Key)));
 
         if (!BeginList("Stage2List", ("", 28), ("아이템", -3), ("위치", 110), ("Lv", 40), ("비고", -1.6f))) return;
@@ -544,6 +562,12 @@ public sealed partial class Plugin
             UiKit.Chips((reason != null, reason ?? string.Empty, UiKit.Warn), (stage2.HasOutfit(entry.ItemId), "세트 가능", UiKit.Lavender),
                 (entry.IsDyed, "염색됨", UiKit.Tag), (reason == null && entry.MateriaCount > 0, $"마테리아 {entry.MateriaCount}", UiKit.Tag));
             GearsetChip(entry.ItemId, s2chips > 0);
+            if (stage2.LastResultFor(entry.Name) is { } prev)
+            {
+                var bad = prev.Contains("실패") || prev.Contains("건너뜁니다") || prev.Contains("거절") || prev.Contains("않았습니다") || prev.Contains("않아");
+                UiKit.Chip("직전: " + (prev.Length > 28 ? prev[..28] + "…" : prev), bad ? UiKit.Warn : UiKit.Muted, true);
+                if (ImGui.IsItemHovered()) ImGui.SetTooltip(prev);
+            }
         }
         EndList();
     }
@@ -744,9 +768,21 @@ public sealed partial class Plugin
         if (dresserSnapshot.HasData) UiKit.MutedText($"(옷장 데이터 {dresserSnapshot.CapturedAt:HH:mm:ss} 기준)");
         else ImGui.TextColored(UiKit.Warn, "(옷장 데이터 없음 — 환상의 옷장을 한 번 열어 주세요)");
 
+        // 4) 추억의 보관함
+        var cabinetOp = config.FilterCabinetOp;
+        if (OpCombo("##f4op", ref cabinetOp)) { config.FilterCabinetOp = cabinetOp; FilterChanged(); }
+        ImGui.SameLine();
+        var cabinetOn = config.FilterCabinetEnabled;
+        if (ImGui.Checkbox("추억의 보관함##f4on", ref cabinetOn)) { config.FilterCabinetEnabled = cabinetOn; FilterChanged(); }
+        ImGui.SameLine();
+        if (ImGui.RadioButton("대상 아님 (보관함에 못 넣는 장비)##f4a", !config.FilterCabinetEligible)) { config.FilterCabinetEligible = false; FilterChanged(); }
+        ImGui.SameLine();
+        if (ImGui.RadioButton("대상 (보관함에 넣을 수 있는 장비)##f4b", config.FilterCabinetEligible)) { config.FilterCabinetEligible = true; FilterChanged(); }
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("게임 데이터(Cabinet 시트) 기준입니다. 이미 보관함에 넣었는지는 판정하지 않습니다.");
+
         if (ImGui.SmallButton("필터 모두 끄기##fclear"))
         {
-            config.FilterJobEnabled = config.FilterLevelEnabled = config.FilterDresserEnabled = false;
+            config.FilterJobEnabled = config.FilterLevelEnabled = config.FilterDresserEnabled = config.FilterCabinetEnabled = false;
             FilterChanged();
         }
         ImGui.SameLine();

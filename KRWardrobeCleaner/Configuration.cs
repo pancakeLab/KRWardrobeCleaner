@@ -54,6 +54,14 @@ public sealed class Configuration : IPluginConfiguration
     public bool FilterDresserOwned { get; set; }
     public int FilterDresserOp { get; set; }
 
+    /// 필터 4: 추억의 보관함. Eligible: true = 보관함에 넣을 수 있는 장비, false = 넣을 수 없는 장비(옷장행).
+    public bool FilterCabinetEnabled { get; set; }
+    public bool FilterCabinetEligible { get; set; }
+    public int FilterCabinetOp { get; set; }
+
+    /// 1번 탭 필터 모드: 한 조각이라도 필터에 맞는 의상 세트는 조각 전체를 체크한다.
+    public bool PullWholeSets { get; set; } = true;
+
     /// 켜면 후보 판정·세트 저장 요청·검증 결과를 Dalamud 로그(/xllog)에 "[KWC]" 접두어로 남긴다.
     public bool DebugLog { get; set; }
 }

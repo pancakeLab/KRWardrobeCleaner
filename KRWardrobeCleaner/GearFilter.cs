@@ -54,7 +54,7 @@ public sealed class GearFilter
         this.dresser = dresser;
     }
 
-    public bool AnyEnabled => config.FilterJobEnabled || config.FilterLevelEnabled || config.FilterDresserEnabled;
+    public bool AnyEnabled => config.FilterJobEnabled || config.FilterLevelEnabled || config.FilterDresserEnabled || config.FilterCabinetEnabled;
 
     /// Warning to show when the dresser condition is on but no dresser data has been seen yet.
     public string? DresserWarning => config.FilterDresserEnabled && !dresser.HasData
@@ -77,6 +77,9 @@ public sealed class GearFilter
         if (config.FilterDresserEnabled)
             Combine(ref result, (FilterOp)config.FilterDresserOp, dresser.Contains(itemId) == config.FilterDresserOwned);
 
+        if (config.FilterCabinetEnabled)
+            Combine(ref result, (FilterOp)config.FilterCabinetOp, excel.TryGetCabinetRow(itemId, out _) == config.FilterCabinetEligible);
+
         return result ?? false;
     }
 
@@ -90,6 +93,8 @@ public sealed class GearFilter
             parts.Add($"{OpWord(parts.Count, config.FilterLevelOp)}레벨 {config.FilterLevelMin}~{config.FilterLevelMax}");
         if (config.FilterDresserEnabled)
             parts.Add($"{OpWord(parts.Count, config.FilterDresserOp)}옷장 {(config.FilterDresserOwned ? "보유중" : "미보유")}");
+        if (config.FilterCabinetEnabled)
+            parts.Add($"{OpWord(parts.Count, config.FilterCabinetOp)}보관함 {(config.FilterCabinetEligible ? "대상" : "대상 아님")}");
         return parts.Count == 0 ? "필터 없음" : string.Join(" ", parts);
     }
 

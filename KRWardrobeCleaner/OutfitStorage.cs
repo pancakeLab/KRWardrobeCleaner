@@ -175,7 +175,32 @@ public sealed unsafe class Stage2InventoryToDresser
     public bool HasOutfit(uint itemId) => outfits.SetsFor(itemId).Any();
     public int SelectedWithOutfit => entries.Count(e => selected.Contains(e.Key) && HasOutfit(e.ItemId));
     public string Status { get; private set; } = "환상의 옷장을 연 뒤 후보를 검색해 주세요.";
-    public string? LastItemStatus { get; private set; }
+
+    private string? lastItemStatus;
+    private readonly List<string> runLog = [];
+    private readonly Dictionary<string, string> lastResultByName = new(StringComparer.Ordinal);
+    private readonly List<PhysicalGearEntry> failedSingles = [];
+    private bool secondPassDone;
+    private ItemLocationKey selBeforeKey;
+    private uint selBeforeId;
+
+    /// Every per-item message is also kept in RunLog (for the UI) and, by item name, in LastResultFor().
+    public string? LastItemStatus
+    {
+        get => lastItemStatus;
+        private set
+        {
+            lastItemStatus = value;
+            if (string.IsNullOrEmpty(value)) return;
+            runLog.Add(value);
+            if (runLog.Count > 300) runLog.RemoveAt(0);
+            var sep = value.IndexOf(": ", StringComparison.Ordinal);
+            if (sep > 0) lastResultByName[value[..sep]] = value[(sep + 2)..];
+        }
+    }
+
+    public IReadOnlyList<string> RunLog => runLog;
+    public string? LastResultFor(string name) => lastResultByName.TryGetValue(name, out var r) ? r : null;
 
     public Stage2InventoryToDresser(ExcelIndex excel, InventoryScanner scanner, OutfitCatalog outfits, GearFilter filter, IGameGui gameGui, IObjectTable objects, ICondition condition, IPluginLog log, Configuration config, System.Action saveConfig)
     {
@@ -469,6 +494,10 @@ public sealed unsafe class Stage2InventoryToDresser
         yesNoOpenAtRequest = false;
         nextSingleAt = 0;
         singleRetried.Clear();
+        runLog.Clear();
+        lastResultByName.Clear();
+        failedSingles.Clear();
+        secondPassDone = false;
         Total = setQueue.Sum(b => b.Pieces.Count) + singleQueue.Count + skippedBlocked;
         LastItemStatus = skippedBlocked > 0 ? $"조건 미달(수리/마테리아) {skippedBlocked}개는 제외했습니다." : null;
         IsRunning = true;
@@ -579,10 +608,32 @@ public sealed unsafe class Stage2InventoryToDresser
             Debug("s2 rounds finished with {Dropped} armoury pieces left (no free bag slot)", dropped);
         }
 
+        if (failedSingles.Count > 0 && !secondPassDone)
+        {
+            // One automatic retry of the singles that failed for transient reasons (dialog/list timing).
+            secondPassDone = true;
+            var retry = failedSingles.ToList();
+            failedSingles.Clear();
+            Failed = Math.Max(0, Failed - retry.Count);
+            foreach (var e in retry) singleQueue.Enqueue(e);
+            singleRetried.Clear();
+            nextSetActionAt = Environment.TickCount64 + 1500;
+            LastItemStatus = $"실패한 단벌 {retry.Count}개를 한 번 더 시도합니다.";
+            log.Information("[KWC] s2 second pass for {Count} failed singles", retry.Count);
+            return;
+        }
+
         IsRunning = false;
         var completed = $"완료: 저장 {Stored} · 제외 {Skipped} · 실패 {Failed}";
+        var reasons = runLog
+            .Where(l => l.Contains("실패") || l.Contains("건너뜁니다") || l.Contains("거절") || l.Contains("않았습니다") || l.Contains("않아"))
+            .Select(l => { var i = l.IndexOf(": ", StringComparison.Ordinal); return i > 0 ? l[(i + 2)..] : l; })
+            .GroupBy(r => r).OrderByDescending(g => g.Count()).Take(3)
+            .Select(g => $"{g.Key} ×{g.Count()}").ToList();
+        var summary = reasons.Count > 0 ? "주요 사유: " + string.Join(" / ", reasons) : null;
         Scan();
         Status = completed;
+        if (summary != null) LastItemStatus = summary;
     }
 
     // ---- pre-stage: the game refuses armoury -> bag moves while the dresser is open (MoveItemSlot rc=10,
@@ -1223,6 +1274,7 @@ public sealed unsafe class Stage2InventoryToDresser
         {
             Failed++;
             LastItemStatus = $"{entry.Name}: 단벌 저장 완료를 확인하지 못해 건너뜁니다.";
+            failedSingles.Add(entry);
             log.Warning("[KWC] s2 single NOT stored {Name} #{Id} {Loc} state={State}", entry.Name, entry.ItemId, entry.Key.Id, singleState);
             FinishSingle();
             return;
@@ -1300,6 +1352,7 @@ public sealed unsafe class Stage2InventoryToDresser
 
                     Failed++;
                     LastItemStatus = $"{entry.Name}: 게임의 맡기기 목록이 갱신되지 않아 건너뜁니다.";
+                    failedSingles.Add(entry);
                     log.Warning("[KWC] s2 single {Name} {Loc}: deposit list still stale after {Ms}ms", entry.Name, entry.Key.Id, ListWaitMs);
                     FinishSingle();
                     return;
@@ -1334,6 +1387,7 @@ public sealed unsafe class Stage2InventoryToDresser
 
                     Skipped++;
                     LastItemStatus = $"{entry.Name}: 게임의 맡기기 목록에서 찾지 못해 건너뜁니다.";
+                    if (!secondPassDone) { Skipped--; Failed++; failedSingles.Add(entry); }
                     Debug("s2 single {Name} {Loc} not in game deposit list (count={Count})", entry.Name, entry.Key.Id, data->CrystallizeItemCount);
                     FinishSingle();
                     return;
@@ -1343,6 +1397,7 @@ public sealed unsafe class Stage2InventoryToDresser
                     return;
 
                 yesNoOpenAtRequest = FindOpenYesNo() != null;
+                if (!TryReadSelectedCrystallizeItem(out selBeforeKey, out selBeforeId)) { selBeforeKey = default; selBeforeId = 0; }
                 if (!RequestSingleDeposit(data, row))
                     return;
 
@@ -1375,7 +1430,8 @@ public sealed unsafe class Stage2InventoryToDresser
                 if (prompt != null)
                 {
                     if (TryReadSelectedCrystallizeItem(out var selKey, out var selId) && selId != 0 &&
-                        (selKey != entry.Key || selId != entry.ItemId))
+                        (selKey != entry.Key || selId != entry.ItemId) &&
+                        (selKey != selBeforeKey || selId != selBeforeId))
                     {
                         // The game is about to store a different item than the one we asked for: decline.
                         YesNoPrompt.No(prompt);
@@ -1389,6 +1445,7 @@ public sealed unsafe class Stage2InventoryToDresser
                         {
                             Failed++;
                             LastItemStatus = $"{entry.Name}: 게임이 계속 다른 아이템을 골라 건너뜁니다.";
+                            failedSingles.Add(entry);
                         }
                         nextSingleAt = now + AfterStoreGapMs;
                         FinishSingle();
@@ -1406,6 +1463,7 @@ public sealed unsafe class Stage2InventoryToDresser
                     Failed++;
                     singleConfirmMisses++;
                     LastItemStatus = $"{entry.Name}: 맡기기 확인 창이 뜨지 않았습니다.";
+                    failedSingles.Add(entry);
                     log.Warning("[KWC] s2 single: no deposit confirm appeared for {Name} {Loc} (method={Method}, misses={Misses})", entry.Name, entry.Key.Id, config.Stage2SingleMethod, singleConfirmMisses);
                     FinishSingle();
                     if (singleConfirmMisses >= ConfirmMissLimit)

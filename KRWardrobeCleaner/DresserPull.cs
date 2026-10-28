@@ -47,6 +47,7 @@ public sealed unsafe class DresserPull
     private readonly List<DresserPullEntry> entries = [];
     private readonly HashSet<string> selected = [];
     private readonly HashSet<string> matched = [];
+    private readonly HashSet<string> companions = [];   // set pieces checked because a sibling matched
     private readonly List<DresserPullEntry> queue = [];
     private readonly Dictionary<uint, int> restoredCounts = [];
     private readonly HashSet<ItemLocationKey> bagKeysBefore = [];
@@ -62,6 +63,7 @@ public sealed unsafe class DresserPull
     public IReadOnlyList<DresserPullEntry> Entries => entries;
     public IReadOnlySet<string> Selected => selected;
     public bool IsMatched(string id) => matched.Contains(id);
+    public bool IsCompanion(string id) => companions.Contains(id);
     public int MatchedCount => matched.Count;
     public bool IsRunning { get; private set; }
     public int Restored { get; private set; }
@@ -85,6 +87,13 @@ public sealed unsafe class DresserPull
         this.log = log;
         this.config = config;
         this.saveConfig = saveConfig;
+    }
+
+    public void SetPullWholeSets(bool value)
+    {
+        config.PullWholeSets = value;
+        saveConfig();
+        ApplyFilters();
     }
 
     public void SetPullToArmory(bool value)
@@ -141,6 +150,7 @@ public sealed unsafe class DresserPull
         if (IsRunning) return;
         var anyFilter = filter.AnyEnabled;
         matched.Clear();
+        companions.Clear();
         selected.Clear();
         if (anyFilter)
         {
@@ -150,12 +160,24 @@ public sealed unsafe class DresserPull
                 matched.Add(entry.Id);
                 selected.Add(entry.Id);
             }
+
+            if (config.PullWholeSets)
+            {
+                // A set is taken out as a whole: every piece of a set that has at least one matching piece.
+                var setSlots = entries.Where(e => e.SetSlot >= 0 && matched.Contains(e.Id)).Select(e => e.DresserSlot).ToHashSet();
+                foreach (var entry in entries)
+                {
+                    if (entry.SetSlot < 0 || !setSlots.Contains(entry.DresserSlot) || matched.Contains(entry.Id)) continue;
+                    companions.Add(entry.Id);
+                    selected.Add(entry.Id);
+                }
+            }
         }
 
         entries.Sort((a, b) =>
         {
-            var ma = matched.Contains(a.Id);
-            var mb = matched.Contains(b.Id);
+            var ma = matched.Contains(a.Id) || companions.Contains(a.Id);
+            var mb = matched.Contains(b.Id) || companions.Contains(b.Id);
             if (ma != mb) return ma ? -1 : 1;
             var c = StringComparer.CurrentCulture.Compare(a.SetName ?? string.Empty, b.SetName ?? string.Empty);
             if (c != 0) return c;
@@ -172,7 +194,7 @@ public sealed unsafe class DresserPull
         var sets = entries.Count(e => e.SetSlot >= 0);
         var warning = filter.DresserWarning is { } w ? " " + w : string.Empty;
         Status = anyFilter
-            ? $"옷장 아이템 {entries.Count}개(세트 조각 {sets}개) 중 필터 일치 {matched.Count}개를 체크했습니다.{warning}"
+            ? $"옷장 아이템 {entries.Count}개(세트 조각 {sets}개) 중 필터 일치 {matched.Count}개{(companions.Count > 0 ? $" + 같은 세트 조각 {companions.Count}개" : string.Empty)}를 체크했습니다.{warning}"
             : $"옷장 아이템 {entries.Count}개(세트 조각 {sets}개). 필터를 켜면 조건에 맞는 것만 체크됩니다.";
     }
 
