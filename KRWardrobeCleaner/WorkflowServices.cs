@@ -529,12 +529,14 @@ public sealed unsafe class Stage4Discard
     private readonly InventoryScanner scanner;
     private readonly GearFilter filter;
     private readonly IGameGui gameGui;
+    private readonly IPluginLog log;
     private readonly Configuration config;
     private readonly System.Action saveConfig;
 
     private readonly List<PhysicalGearEntry> entries = [];
     private readonly HashSet<ItemLocationKey> selected = [];
     private readonly HashSet<ItemLocationKey> matched = [];
+    private readonly List<string> runLog = [];
     private readonly Queue<DiscardEntry> queue = new();
 
     private DiscardEntry? pending;
@@ -554,13 +556,29 @@ public sealed unsafe class Stage4Discard
     public int Total { get; private set; }
     public int Done => Discarded + Skipped + Failed;
     public string Status { get; private set; } = "파기 후보를 검색해 주세요.";
-    public string? LastItemStatus { get; private set; }
 
-    public Stage4Discard(InventoryScanner scanner, GearFilter filter, IGameGui gameGui, Configuration config, System.Action saveConfig)
+    private string? lastItemStatus;
+    public string? LastItemStatus
+    {
+        get => lastItemStatus;
+        private set
+        {
+            lastItemStatus = value;
+            if (string.IsNullOrEmpty(value)) return;
+            runLog.Add(value);
+            if (runLog.Count > 300) runLog.RemoveAt(0);
+        }
+    }
+
+    public IReadOnlyList<string> RunLog => runLog;
+    public IReadOnlyList<DiscardEntry> PreviewInventory4() => scanner.ScanContainerAll(InventoryType.Inventory4);
+
+    public Stage4Discard(InventoryScanner scanner, GearFilter filter, IGameGui gameGui, IPluginLog log, Configuration config, System.Action saveConfig)
     {
         this.scanner = scanner;
         this.filter = filter;
         this.gameGui = gameGui;
+        this.log = log;
         this.config = config;
         this.saveConfig = saveConfig;
     }
@@ -744,13 +762,41 @@ public sealed unsafe class Stage4Discard
             return;
         }
 
-        var rc = inventory->DiscardItem(entry.Key.Container, (ushort)entry.Key.Slot);
-        if (rc != 0)
+        var container = inventory->GetInventoryContainer(entry.Key.Container);
+        var item = container == null ? null : container->GetInventorySlot(entry.Key.Slot);
+        if (item == null || item->ItemId == 0 || item->GetBaseItemId() != entry.ItemId)
         {
-            Failed++;
-            LastItemStatus = $"{entry.Name}: 파기 요청이 거절되었습니다. ({rc})";
-            nextAt = now + 500;
+            Skipped++;
+            LastItemStatus = $"{entry.Name}: 칸 내용이 바뀌어 건너뜁니다.";
+            nextAt = now + 250;
             return;
+        }
+
+        if (config.DebugLog)
+            log.Information("[KWC] s4 discard {Name} #{Id} container={Container}({ContainerId}) slot={Slot} qty={Qty} raw={Raw} via={Via}",
+                entry.Name, entry.ItemId, entry.Key.Container, (int)entry.Key.Container, entry.Key.Slot, item->Quantity, item->ItemId, config.Stage4DirectDiscard ? "manager" : "agent");
+
+        if (config.Stage4DirectDiscard)
+        {
+            var rc = inventory->DiscardItem(entry.Key.Container, (ushort)entry.Key.Slot);
+            if (rc != 0)
+            {
+                Failed++;
+                LastItemStatus = $"{entry.Name}: 파기 요청이 거절되었습니다. ({rc})";
+                nextAt = now + 500;
+                return;
+            }
+        }
+        else
+        {
+            // Same path as the game's own context menu: the agent opens the confirm dialog for this exact slot.
+            var agent = AgentInventoryContext.Instance();
+            if (agent == null)
+            {
+                Stop("인벤토리 에이전트를 찾을 수 없습니다.");
+                return;
+            }
+            agent->DiscardItem(item, entry.Key.Container, entry.Key.Slot, 0);
         }
 
         pending = entry;
@@ -769,6 +815,7 @@ public sealed unsafe class Stage4Discard
         Discarded = Skipped = Failed = 0;
         pending = null;
         nextAt = 0;
+        runLog.Clear();
         LastItemStatus = null;
         mode = discardMode;
         IsRunning = true;

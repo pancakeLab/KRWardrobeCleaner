@@ -25,6 +25,8 @@ public sealed class Configuration : IPluginConfiguration
 
     public bool Stage4SmartIncludeCrafterGatherer { get; set; }
     public int Stage4SmartMaxLevel { get; set; } = 100;
+    /// 파기 방식. false = 인벤토리 에이전트(게임 우클릭 메뉴와 같은 경로, 기본), true = InventoryManager.DiscardItem 직접 호출.
+    public bool Stage4DirectDiscard { get; set; }
 
     /// 옷장 중복 정리: 같은 아이템이 여러 개면 염색된 것을 남기고 나머지를 중복분으로 본다.
     public bool DuplicateKeepDyedFirst { get; set; } = true;

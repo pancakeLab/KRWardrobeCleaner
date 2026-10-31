@@ -10,7 +10,7 @@ namespace KRWardrobeCleaner;
 
 public sealed partial class Plugin : IDalamudPlugin
 {
-    private const string VersionLabel = "v0.14.0";
+    private const string VersionLabel = "v0.14.1";
     private static readonly string[] CommandNames = ["/히메짱가방"];
 
     [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
@@ -58,7 +58,7 @@ public sealed partial class Plugin : IDalamudPlugin
         pull = new DresserPull(excel, outfits, scanner, filter, GameGui, Condition, Log, config, SaveConfig);
         stage2 = new Stage2InventoryToDresser(excel, scanner, outfits, filter, GameGui, Objects, Condition, Log, config, SaveConfig);
         transfer = new GearTransfer(excel, scanner, filter, Log, config, SaveConfig);
-        stage4 = new Stage4Discard(scanner, filter, GameGui, config, SaveConfig);
+        stage4 = new Stage4Discard(scanner, filter, GameGui, Log, config, SaveConfig);
         recorder = new CallbackRecorder(Interop, Log);
 
         foreach (var command in CommandNames)

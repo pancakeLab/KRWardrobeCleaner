@@ -849,6 +849,10 @@ public sealed partial class Plugin
             var maxLevel = config.Stage4SmartMaxLevel;
             if (ImGui.InputInt("착용 레벨 이하##s4lvl", ref maxLevel))
                 stage4.UpdateSmartSettings(config.Stage4SmartIncludeCrafterGatherer, maxLevel);
+            ImGui.Separator();
+            var direct = config.Stage4DirectDiscard;
+            if (ImGui.Checkbox("파기를 직접 요청 (창 경유 안 함)##s4direct", ref direct)) { config.Stage4DirectDiscard = direct; SaveConfig(); }
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("기본(끔)은 게임의 우클릭 '버리기'와 같은 경로로 확인 창을 띄운 뒤 자동으로 '예'를 누릅니다. 켜면 이전 방식(InventoryManager 직접 호출)을 씁니다.");
             EndOptions();
         }
 
@@ -872,6 +876,20 @@ public sealed partial class Plugin
         if (running && StopButton("s4stop")) stage4.Stop();
 
         StatusBlock(stage4.Status, stage4.LastItemStatus, running, stage4.Done, stage4.Total);
+        if (stage4.RunLog.Count > 0 && ImGui.TreeNodeEx($"실행 기록 ({stage4.RunLog.Count}줄)###s4runlog", ImGuiTreeNodeFlags.SpanAvailWidth))
+        {
+            if (ImGui.BeginChild("s4runlogchild", new Vector2(0, 120), true))
+            {
+                for (var i = stage4.RunLog.Count - 1; i >= 0 && i >= stage4.RunLog.Count - 100; i--)
+                {
+                    var line = stage4.RunLog[i];
+                    var bad = line.Contains("실패") || line.Contains("건너뜁니다") || line.Contains("거절") || line.Contains("못해");
+                    ImGui.TextColored(bad ? UiKit.Warn : UiKit.Muted, line);
+                }
+            }
+            ImGui.EndChild();
+            ImGui.TreePop();
+        }
         ListToolbar(list4, stage4.Selected.Count, stage4.Entries.Count, stage4.MatchedCount);
 
         if (!BeginList("Stage4List", ("", 28), ("아이템", -3), ("위치", 110), ("Lv", 40), ("비고", -1.2f))) return;
@@ -913,6 +931,21 @@ public sealed partial class Plugin
         UiKit.Icon(FontAwesomeIcon.ExclamationTriangle, UiKit.Warn);
         ImGui.SameLine();
         ImGui.TextColored(UiKit.Warn, $"{what}을(를) 파기합니다. 되돌릴 수 없습니다.");
+        if (pendingDiscard == 2)
+        {
+            var preview = stage4.PreviewInventory4();
+            if (ImGui.BeginChild("bag4preview", new Vector2(420, Math.Min(260, 22 * Math.Max(1, preview.Count) + 8)), true))
+            {
+                foreach (var p in preview)
+                {
+                    ItemIcon(p.ItemId);
+                    ImGui.TextUnformatted(p.Quantity > 1 ? $"{p.Name} ×{p.Quantity}" : p.Name);
+                    ImGui.SameLine();
+                    UiKit.MutedText($"({Where(p.Key.Container)} {p.Key.Slot + 1}칸)");
+                }
+            }
+            ImGui.EndChild();
+        }
         ImGui.Spacing();
         if (UiKit.Button(FontAwesomeIcon.Trash, "파기 시작", "confirmyes", 2))
         {
